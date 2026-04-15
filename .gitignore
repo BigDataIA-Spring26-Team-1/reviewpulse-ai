@@ -6,6 +6,8 @@ __pycache__/
 # C extensions
 *.so
 
+data/
+
 # Distribution / packaging
 .Python
 build/
@@ -200,6 +202,10 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# Frontend artifacts
+industrial-digital-twin/node_modules/
+industrial-digital-twin/dist/
 
 # Marimo
 marimo/_static/

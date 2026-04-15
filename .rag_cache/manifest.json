@@ -1,0 +1,15 @@
+{
+  "fingerprint": "2fd9b3ea2325b62a41c9fc5cf3afea5145181f7fe624ce5cd9c7bd308d525e90",
+  "namespace": "industrial-digital-twin-2fd9b3ea2325",
+  "index_name": "industrial-digital-twin-rag",
+  "host": "industrial-digital-twin-rag-iaakwun.svc.aped-4627-b74a.pinecone.io",
+  "document_count": 197,
+  "source_breakdown": {
+    "proposal": 72,
+    "code": 100,
+    "live_source": 25
+  },
+  "proposal_path": "C:\\Users\\Patil\\Downloads\\DAMG7245_Digital_Twin_Proposal_SUBMISSION (2).pdf",
+  "indexed_at": "2026-04-03T20:19:11.857442+00:00",
+  "warnings": []
+}
