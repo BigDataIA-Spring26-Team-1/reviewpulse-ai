@@ -1,0 +1,38 @@
+# ReviewPulse AI — Dependencies
+# Core
+pandas>=2.0
+datasets>=2.14
+matplotlib>=3.7
+seaborn>=0.12
+
+# API connectors
+youtube-transcript-api>=0.6
+praw>=7.7  # Reddit API (alternative to raw urllib)
+
+# NLP & ML
+sentence-transformers>=2.2
+transformers>=4.30
+torch>=2.0
+
+# Vector store
+chromadb>=0.4
+
+# Backend
+fastapi>=0.100
+uvicorn>=0.23
+pydantic>=2.0
+
+# Orchestration
+apache-airflow>=2.7
+
+# Cache
+redis>=5.0
+
+# Testing
+pytest>=7.4
+pytest-cov>=4.1
+ruff>=0.1
+mypy>=1.5
+
+# Data processing (for production Spark jobs)
+# pyspark>=3.5  # Install separately for Spark jobs
