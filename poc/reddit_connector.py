@@ -25,6 +25,9 @@ import urllib.parse
 import urllib.error
 from datetime import datetime
 from typing import Optional
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ── Configuration ──
 SUBREDDITS = [

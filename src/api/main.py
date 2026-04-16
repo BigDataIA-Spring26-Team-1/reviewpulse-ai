@@ -16,6 +16,7 @@ from fastapi import FastAPI, Query
 from pydantic import BaseModel
 from pyspark.sql import SparkSession
 from sentence_transformers import SentenceTransformer
+from dotenv import load_dotenv
 
 try:
     from anthropic import Anthropic
@@ -23,6 +24,7 @@ try:
 except ImportError:
     ANTHROPIC_AVAILABLE = False
 
+load_dotenv()
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 DATA_DIR = os.path.join(BASE_DIR, "data")
