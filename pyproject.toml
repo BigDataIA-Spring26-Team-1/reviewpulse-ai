@@ -29,6 +29,9 @@ pytest-cov = "^6.1.1"
 ruff = "^0.11.6"
 mypy = "^1.15.0"
 
+[tool.pytest.ini_options]
+addopts = "-p no:cacheprovider"
+
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"

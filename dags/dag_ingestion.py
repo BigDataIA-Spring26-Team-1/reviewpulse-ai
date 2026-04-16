@@ -1,27 +1,51 @@
 """
-ReviewPulse AI — Airflow DAG: Data Ingestion Pipeline
-======================================================
-Schedules data collection from all sources.
-Runs daily at 2 AM UTC.
+ReviewPulse AI Airflow DAG for the implemented MVP pipeline.
 
-This DAG demonstrates:
-- Parallel task execution (Reddit + YouTube run simultaneously)
-- Dependencies (normalization waits for all ingestion to complete)
-- Error handling (individual source failures don't stop the pipeline)
+This DAG follows the proposal's implementation order:
+1. Validate and normalize raw source data into a shared JSONL preview.
+2. Run the Spark normalization job for the core sources.
+3. Score sentiment.
+4. Build embeddings.
+5. Run tests.
 """
 
+from __future__ import annotations
+
+import importlib
 from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any
 
-try:
-    from airflow import DAG
-    from airflow.operators.python import PythonOperator
-    from airflow.operators.bash import BashOperator
-    AIRFLOW_AVAILABLE = True
-except ImportError:
-    AIRFLOW_AVAILABLE = False
-    print("Airflow not installed. This file defines the DAG structure for documentation.")
 
-if AIRFLOW_AVAILABLE:
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT_POSIX = PROJECT_ROOT.as_posix()
+
+DAG_STRUCTURE = """
+DAG: reviewpulse_mvp_pipeline
+Schedule: Daily at 2 AM UTC
+
+Task Flow:
+    normalize_local_preview
+        -> normalize_reviews_spark
+        -> score_sentiment
+        -> build_embeddings
+        -> run_tests
+"""
+
+
+def _load_airflow_objects() -> tuple[Any, Any]:
+    try:
+        airflow_module = importlib.import_module("airflow")
+        bash_module = importlib.import_module("airflow.operators.bash")
+    except ImportError as exc:
+        raise RuntimeError("Airflow is not installed.") from exc
+
+    return airflow_module.DAG, bash_module.BashOperator
+
+
+def _build_dag() -> Any:
+    DAG, BashOperator = _load_airflow_objects()
+
     default_args = {
         "owner": "reviewpulse",
         "depends_on_past": False,
@@ -31,68 +55,55 @@ if AIRFLOW_AVAILABLE:
     }
 
     with DAG(
-        dag_id="reviewpulse_ingestion",
+        dag_id="reviewpulse_mvp_pipeline",
         default_args=default_args,
-        description="Daily ingestion from Reddit, YouTube, and refresh normalization",
-        schedule_interval="0 2 * * *",  # Daily at 2 AM UTC
+        description="Proposal-aligned MVP pipeline for ReviewPulse AI",
+        schedule="0 2 * * *",
         start_date=datetime(2026, 4, 1),
         catchup=False,
-        tags=["reviewpulse", "ingestion"],
-    ) as dag:
-
-        # Task 1: Pull Reddit data
-        ingest_reddit = BashOperator(
-            task_id="ingest_reddit",
-            bash_command="cd /opt/reviewpulse && python poc/reddit_connector.py",
+        tags=["reviewpulse", "mvp"],
+    ) as airflow_dag:
+        normalize_local_preview = BashOperator(
+            task_id="normalize_local_preview",
+            bash_command=f"cd {PROJECT_ROOT_POSIX} && python -m src.normalization.core",
         )
 
-        # Task 2: Pull YouTube transcripts
-        ingest_youtube = BashOperator(
-            task_id="ingest_youtube",
-            bash_command="cd /opt/reviewpulse && python poc/youtube_extractor.py",
+        normalize_spark = BashOperator(
+            task_id="normalize_reviews_spark",
+            bash_command=f"cd {PROJECT_ROOT_POSIX} && python -m src.spark.normalize_reviews_spark",
         )
 
-        # Task 3: Normalize all sources into unified schema
-        normalize = BashOperator(
-            task_id="normalize_schema",
-            bash_command="cd /opt/reviewpulse && python poc/normalize_schema.py",
+        score_sentiment = BashOperator(
+            task_id="score_sentiment",
+            bash_command=f"cd {PROJECT_ROOT_POSIX} && python -m src.ml.sentiment_scoring",
         )
 
-        # Task 4: Run aspect extraction on new data
-        extract_aspects = BashOperator(
-            task_id="extract_aspects",
-            bash_command="cd /opt/reviewpulse && python poc/aspect_extraction.py",
+        build_embeddings = BashOperator(
+            task_id="build_embeddings",
+            bash_command=f"cd {PROJECT_ROOT_POSIX} && python -m src.retrieval.build_embeddings",
         )
 
-        # Task 5: Run tests to verify pipeline health
         run_tests = BashOperator(
             task_id="run_tests",
-            bash_command="cd /opt/reviewpulse && python tests/test_normalization.py",
+            bash_command=f"cd {PROJECT_ROOT_POSIX} && pytest tests/test_normalization.py -v",
         )
 
-        # Dependencies:
-        # Reddit and YouTube run in parallel
-        # Normalization waits for both
-        # Extraction waits for normalization
-        # Tests run after extraction
-        [ingest_reddit, ingest_youtube] >> normalize >> extract_aspects >> run_tests
+        normalize_local_preview >> normalize_spark >> score_sentiment >> build_embeddings >> run_tests
 
-else:
-    # Document the DAG structure even without Airflow installed
-    DAG_STRUCTURE = """
-    DAG: reviewpulse_ingestion
-    Schedule: Daily at 2 AM UTC
-    
-    Task Flow:
-    
-        ingest_reddit ──┐
-                        ├──> normalize_schema ──> extract_aspects ──> run_tests
-        ingest_youtube ─┘
-    
-    - Reddit and YouTube ingestion run in PARALLEL
-    - Normalization waits for BOTH to complete
-    - Aspect extraction runs after normalization
-    - Tests verify pipeline health after each run
-    - Each task has 2 retries with 5-minute delay
-    """
-    print(DAG_STRUCTURE)
+    return airflow_dag
+
+
+dag: Any | None = None
+
+try:
+    dag = _build_dag()
+except RuntimeError:
+    dag = None
+
+
+if __name__ == "__main__":
+    if dag is None:
+        print("Airflow is not installed. This file documents the DAG structure.")
+        print(DAG_STRUCTURE)
+    else:
+        print(f"Loaded DAG: {getattr(dag, 'dag_id', 'reviewpulse_mvp_pipeline')}")

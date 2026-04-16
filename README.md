@@ -101,7 +101,7 @@ Normalization formulas:
 - Amazon: `(rating - 1) / 4`
 - Yelp: `(stars - 1) / 4`
 - eBay: `seller_rating / 100`
-- iFixit: `repairability_score / 10`
+- iFixit: `(repairability_score - 1) / 9`
 - YouTube: `NULL`
 
 ---
@@ -136,14 +136,17 @@ reviewpulse-ai/
 |-- src/
 |   |-- api/
 |   |   `-- main.py
+|   |-- common/
+|   |   `-- settings.py
 |   |-- frontend/
 |   |   `-- app.py
 |   |-- ml/
 |   |   `-- sentiment_scoring.py
+|   |-- normalization/
+|   |   `-- core.py
 |   |-- retrieval/
 |   |   |-- build_embeddings.py
-|   |   |-- query_reviews.py
-|   |   `-- query_reviews_filtered.py
+|   |   `-- query_reviews.py
 |   `-- spark/
 |       `-- normalize_reviews_spark.py
 |-- tests/
@@ -166,6 +169,8 @@ cd reviewpulse-ai
 poetry install --no-root
 ```
 
+Poetry is the supported dependency manager for this repository. There is no separate `requirements.txt`.
+
 ### 2. Environment variables
 
 ```bash
@@ -185,10 +190,12 @@ If no Anthropic key is configured, the chat endpoint falls back to a grounded ex
 
 ```bash
 # Step 1: Generate or ingest source data
-poetry run python poc/ebay_pipeline.py
-poetry run python poc/ifixit_pipeline.py
-poetry run python poc/youtube_extractor.py
+# Amazon sample generation / profiling
 poetry run python poc/eda_amazon.py
+
+# Optional demo/POC sources
+poetry run python poc/youtube_extractor.py
+poetry run python poc/reddit_connector.py
 
 # Step 2: Normalize into unified schema
 poetry run python poc/normalize_schema.py
