@@ -1,14 +1,16 @@
 """
-ReviewPulse AI — MVP FastAPI Backend
-===================================
-Provides endpoints for health, source stats, semantic search, and grounded chat.
+ReviewPulse AI FastAPI backend.
 
 Run:
     poetry run uvicorn src.api.main:app --reload --reload-dir src
 """
 
+from __future__ import annotations
+
 import os
 import re
+import sys
+from pathlib import Path
 from typing import Optional
 
 import chromadb
@@ -16,22 +18,38 @@ from fastapi import FastAPI, Query
 from pydantic import BaseModel
 from pyspark.sql import SparkSession
 from sentence_transformers import SentenceTransformer
-from dotenv import load_dotenv
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv(*_args, **_kwargs) -> bool:
+        return False
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.common.settings import get_settings
+
 
 try:
     from anthropic import Anthropic
+
     ANTHROPIC_AVAILABLE = True
 except ImportError:
     ANTHROPIC_AVAILABLE = False
 
-load_dotenv()
 
-BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-DATA_DIR = os.path.join(BASE_DIR, "data")
-CHROMA_DIR = os.path.join(DATA_DIR, "chromadb_reviews")
-PARQUET_PATH = os.path.join(DATA_DIR, "reviews_with_sentiment_parquet")
+load_dotenv(PROJECT_ROOT / ".env")
+settings = get_settings()
+
+CHROMA_DIR = str(settings.chroma_path)
+PARQUET_PATH = str(settings.sentiment_parquet_path)
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-sonnet-20240229")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+CHROMA_COLLECTION_NAME = os.getenv("CHROMA_COLLECTION_NAME", "reviewpulse_reviews")
 
 app = FastAPI(title="ReviewPulse AI API", version="0.1.0")
 
@@ -65,30 +83,29 @@ class ChatResponse(BaseModel):
     citations: list[Citation]
 
 
-def get_spark():
+def get_spark() -> SparkSession:
     return (
         SparkSession.builder
         .appName("ReviewPulse-API")
-        .master("local[*]")
-        .config("spark.sql.session.timeZone", "UTC")
+        .master(settings.spark_master)
+        .config("spark.sql.session.timeZone", settings.spark_sql_session_timezone)
         .getOrCreate()
     )
 
 
-def get_model():
-    return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+def get_model() -> SentenceTransformer:
+    return SentenceTransformer(EMBEDDING_MODEL)
 
 
 def get_collection():
     client = chromadb.PersistentClient(path=CHROMA_DIR)
-    return client.get_collection(name="reviewpulse_reviews")
+    return client.get_collection(name=CHROMA_COLLECTION_NAME)
 
 
 def looks_like_machine_id(value: str) -> bool:
     if not value:
         return True
-    value = str(value).strip()
-    return bool(re.fullmatch(r"[A-Za-z0-9_-]{16,}", value))
+    return bool(re.fullmatch(r"[A-Za-z0-9_-]{16,}", str(value).strip()))
 
 
 def clean_display_name(meta: dict) -> str:
@@ -110,15 +127,17 @@ def clean_display_name(meta: dict) -> str:
             return display_name
         return "Yelp Business Review"
 
+    if source == "ebay":
+        return display_name or product_name or "eBay Listing"
+
+    if source == "ifixit":
+        return display_name or product_name or "iFixit Guide"
+
     if source == "reddit":
-        if display_name and display_name.lower() != "unknown":
-            return display_name
-        return "Reddit Discussion"
+        return display_name or "Reddit Discussion"
 
     if source == "youtube":
-        if display_name and display_name.lower() != "unknown":
-            return display_name
-        return "YouTube Review"
+        return display_name or "YouTube Review"
 
     return display_name or product_name or "Unknown Item"
 
@@ -130,35 +149,33 @@ def clean_display_category(meta: dict) -> str:
 
     if source == "amazon":
         return display_category or "Electronics Product"
-
     if source == "yelp":
-        if display_category and not looks_like_machine_id(display_category):
-            return display_category
-        return "Local Business"
-
+        return display_category or "Local Business"
+    if source == "ebay":
+        return display_category or product_category or "Marketplace Listing"
+    if source == "ifixit":
+        return display_category or product_category or "Repair Guide"
     if source == "reddit":
         return display_category or product_category or "Forum Discussion"
-
     if source == "youtube":
         return display_category or "Video Review"
-
     return display_category or product_category or "Unknown Category"
 
 
 def clean_entity_type(meta: dict) -> str:
-    source = str(meta.get("source", "")).strip()
     entity_type = str(meta.get("entity_type", "")).strip()
-
     if entity_type:
         return entity_type
 
     defaults = {
         "amazon": "product_review",
         "yelp": "business_review",
+        "ebay": "listing_review",
+        "ifixit": "repair_review",
         "reddit": "forum_post",
         "youtube": "video_transcript",
     }
-    return defaults.get(source, "unknown")
+    return defaults.get(str(meta.get("source", "")).strip(), "unknown")
 
 
 def retrieve_reviews(query: str, source_filter: Optional[str] = None, n_results: int = 5):
@@ -167,13 +184,9 @@ def retrieve_reviews(query: str, source_filter: Optional[str] = None, n_results:
 
     model = get_model()
     collection = get_collection()
-
     query_embedding = model.encode([query])[0].tolist()
 
-    where = None
-    if source_filter:
-        where = {"source": source_filter.lower()}
-
+    where = {"source": source_filter.lower()} if source_filter else None
     results = collection.query(
         query_embeddings=[query_embedding],
         n_results=n_results,
@@ -186,20 +199,20 @@ def retrieve_reviews(query: str, source_filter: Optional[str] = None, n_results:
     distances = results.get("distances", [[]])[0]
 
     output = []
-    for doc, meta, dist in zip(documents, metadatas, distances):
+    for document, metadata, distance in zip(documents, metadatas, distances):
         output.append(
             {
-                "source": str(meta.get("source", "")),
-                "product_name": str(meta.get("product_name", "")),
-                "product_category": str(meta.get("product_category", "")),
-                "display_name": clean_display_name(meta),
-                "display_category": clean_display_category(meta),
-                "entity_type": clean_entity_type(meta),
-                "sentiment_label": str(meta.get("sentiment_label", "")),
-                "sentiment_score": float(meta.get("sentiment_score", 0.0)),
-                "source_url": str(meta.get("source_url", "")),
-                "distance": float(dist),
-                "review_text": str(doc),
+                "source": str(metadata.get("source", "")),
+                "product_name": str(metadata.get("product_name", "")),
+                "product_category": str(metadata.get("product_category", "")),
+                "display_name": clean_display_name(metadata),
+                "display_category": clean_display_category(metadata),
+                "entity_type": clean_entity_type(metadata),
+                "sentiment_label": str(metadata.get("sentiment_label", "")),
+                "sentiment_score": float(metadata.get("sentiment_score", 0.0)),
+                "source_url": str(metadata.get("source_url", "")),
+                "distance": float(distance),
+                "review_text": str(document),
             }
         )
 
@@ -210,14 +223,12 @@ def fallback_answer(query: str, retrieved: list[dict]) -> str:
     if not retrieved:
         return "I could not find relevant reviews for that query."
 
-    positives = []
-    negatives = []
-    neutrals = []
+    positives: list[str] = []
+    negatives: list[str] = []
+    neutrals: list[str] = []
 
     for item in retrieved[:5]:
-        summary_line = (
-            f"{item['display_name']} ({item['display_category']}, {item['source']})"
-        )
+        summary_line = f"{item['display_name']} ({item['display_category']}, {item['source']})"
         if item["sentiment_label"] == "positive":
             positives.append(summary_line)
         elif item["sentiment_label"] == "negative":
@@ -226,30 +237,13 @@ def fallback_answer(query: str, retrieved: list[dict]) -> str:
             neutrals.append(summary_line)
 
     parts = [f"Based on the retrieved reviews for '{query}', here is a grounded summary."]
-
     if positives:
-        parts.append(
-            "Positive evidence appears in reviews such as "
-            + ", ".join(positives[:2])
-            + "."
-        )
-
+        parts.append("Positive evidence appears in reviews such as " + ", ".join(positives[:2]) + ".")
     if negatives:
-        parts.append(
-            "Negative evidence appears in reviews such as "
-            + ", ".join(negatives[:2])
-            + "."
-        )
-
+        parts.append("Negative evidence appears in reviews such as " + ", ".join(negatives[:2]) + ".")
     if neutrals and not negatives:
-        parts.append(
-            "Some results are neutral or mixed, including "
-            + ", ".join(neutrals[:2])
-            + "."
-        )
-
+        parts.append("Some results are neutral or mixed, including " + ", ".join(neutrals[:2]) + ".")
     parts.append("This answer is based only on the retrieved review text and citations below.")
-
     return " ".join(parts)
 
 
@@ -264,9 +258,9 @@ def generate_grounded_answer(query: str, retrieved: list[dict]) -> str:
         client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
         context_blocks = []
-        for i, item in enumerate(retrieved, start=1):
+        for index, item in enumerate(retrieved, start=1):
             context_blocks.append(
-                f"[Review {i}]\n"
+                f"[Review {index}]\n"
                 f"Source: {item['source']}\n"
                 f"Display Name: {item['display_name']}\n"
                 f"Display Category: {item['display_category']}\n"
@@ -300,19 +294,15 @@ Now answer the user query using only this evidence.
             model=ANTHROPIC_MODEL,
             max_tokens=400,
             temperature=0.2,
-            messages=[
-                {"role": "user", "content": prompt}
-            ],
+            messages=[{"role": "user", "content": prompt}],
         )
 
         parts = response.content
         if parts and hasattr(parts[0], "text"):
             return parts[0].text.strip()
-
         return fallback_answer(query, retrieved)
-
-    except Exception as e:
-        print(f"Anthropic call failed: {e}")
+    except Exception as error:
+        print(f"Anthropic call failed: {error}")
         return fallback_answer(query, retrieved)
 
 
@@ -335,10 +325,7 @@ def source_stats():
     spark.stop()
 
     return {
-        "source_counts": [
-            {"source": row["source"], "count": row["count"]}
-            for row in counts
-        ],
+        "source_counts": [{"source": row["source"], "count": row["count"]} for row in counts],
         "sentiment_breakdown": [
             {
                 "source": row["source"],
@@ -353,7 +340,10 @@ def source_stats():
 @app.get("/search/semantic", response_model=list[SearchResponse])
 def semantic_search(
     query: str = Query(..., description="Natural-language query"),
-    source_filter: Optional[str] = Query(None, description="amazon/yelp/reddit/youtube"),
+    source_filter: Optional[str] = Query(
+        None,
+        description="amazon/yelp/ebay/ifixit/reddit/youtube",
+    ),
     n_results: int = Query(5, ge=1, le=20),
 ):
     results = retrieve_reviews(query=query, source_filter=source_filter, n_results=n_results)

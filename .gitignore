@@ -51,6 +51,7 @@ coverage.xml
 *.py.cover
 .hypothesis/
 .pytest_cache/
+pytest-cache-files-*/
 cover/
 
 # Translations
@@ -202,6 +203,9 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# Project-local caches
+.rag_cache/
 
 # Frontend artifacts
 industrial-digital-twin/node_modules/
