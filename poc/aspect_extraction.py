@@ -18,6 +18,9 @@ import json
 import os
 import re
 from typing import Optional
+from dotenv import load_dotenv
+
+load_dotenv()
 
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
 
