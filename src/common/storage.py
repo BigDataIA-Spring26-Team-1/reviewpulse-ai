@@ -1,34 +1,34 @@
 """S3 storage helpers for run-based pipeline publishing."""
-
+ 
 from __future__ import annotations
-
+ 
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-
+ 
 from src.common.settings import Settings
-
-
+ 
+ 
 try:
     import boto3
 except ImportError:
     boto3 = None
-
-
+ 
+ 
 def sanitize_storage_component(value: str) -> str:
     return str(value).strip().strip("/").replace("\\", "/")
-
-
+ 
+ 
 def join_s3_uri(bucket: str, *parts: str, trailing_slash: bool = False) -> str:
     cleaned_parts = [sanitize_storage_component(part) for part in parts if sanitize_storage_component(part)]
     uri = "s3://" + "/".join([sanitize_storage_component(bucket), *cleaned_parts])
     if trailing_slash and not uri.endswith("/"):
         return uri + "/"
     return uri
-
-
+ 
+ 
 def parse_s3_uri(uri: str) -> tuple[str, str]:
     if not uri.startswith("s3://"):
         raise ValueError(f"Expected S3 URI, got: {uri}")
@@ -37,14 +37,14 @@ def parse_s3_uri(uri: str) -> tuple[str, str]:
     if not bucket:
         raise ValueError(f"Missing bucket in S3 URI: {uri}")
     return bucket, key
-
-
+ 
+ 
 @dataclass(frozen=True, slots=True)
 class S3PathResolver:
     bucket: str
     raw_prefix: str
     processed_prefix: str
-
+ 
     def raw_run_prefix(self, source: str, run_id: str) -> str:
         return join_s3_uri(
             self.bucket,
@@ -54,7 +54,7 @@ class S3PathResolver:
             sanitize_storage_component(run_id),
             trailing_slash=True,
         )
-
+ 
     def raw_current_prefix(self, source: str) -> str:
         return join_s3_uri(
             self.bucket,
@@ -63,7 +63,7 @@ class S3PathResolver:
             "current",
             trailing_slash=True,
         )
-
+ 
     def processed_run_prefix(self, stage: str, run_id: str) -> str:
         return join_s3_uri(
             self.bucket,
@@ -73,7 +73,7 @@ class S3PathResolver:
             sanitize_storage_component(run_id),
             trailing_slash=True,
         )
-
+ 
     def processed_current_prefix(self, stage: str) -> str:
         return join_s3_uri(
             self.bucket,
@@ -82,18 +82,18 @@ class S3PathResolver:
             "current",
             trailing_slash=True,
         )
-
+ 
     def marker_uri(self, current_prefix: str) -> str:
         return current_prefix.rstrip("/") + "/_LATEST_RUN.json"
-
-
+ 
+ 
 class S3StorageManager:
     """Uploads run artifacts and promotes successful outputs into current/."""
-
+ 
     def __init__(self, resolver: S3PathResolver, client: Any) -> None:
         self.resolver = resolver
         self.client = client
-
+ 
     @classmethod
     def from_settings(cls, settings: Settings, client: Any | None = None) -> "S3StorageManager":
         if not settings.s3_enabled:
@@ -110,55 +110,55 @@ class S3StorageManager:
             ),
             client=client,
         )
-
+ 
     def upload_file(self, local_path: Path, destination_uri: str) -> str:
         if not local_path.exists():
             raise FileNotFoundError(f"Local file not found: {local_path}")
-
+ 
         bucket, key = parse_s3_uri(destination_uri)
         self.client.upload_file(str(local_path), bucket, key)
         return destination_uri
-
+ 
     def upload_directory(self, local_dir: Path, destination_prefix: str) -> list[str]:
         if not local_dir.exists() or not local_dir.is_dir():
             raise FileNotFoundError(f"Local directory not found: {local_dir}")
-
+ 
         uploaded_uris: list[str] = []
         for local_path in sorted(path for path in local_dir.rglob("*") if path.is_file()):
             relative_path = local_path.relative_to(local_dir).as_posix()
             destination_uri = destination_prefix + relative_path
             self.upload_file(local_path, destination_uri)
             uploaded_uris.append(destination_uri)
-
+ 
         if not uploaded_uris:
             raise RuntimeError(f"No files found to upload in directory: {local_dir}")
         return uploaded_uris
-
+ 
     def list_objects(self, prefix_uri: str) -> list[str]:
         bucket, prefix = parse_s3_uri(prefix_uri)
         continuation_token: str | None = None
         objects: list[str] = []
-
+ 
         while True:
             params: dict[str, Any] = {"Bucket": bucket, "Prefix": prefix}
             if continuation_token:
                 params["ContinuationToken"] = continuation_token
-
+ 
             response = self.client.list_objects_v2(**params)
             for item in response.get("Contents", []):
                 objects.append(join_s3_uri(bucket, item["Key"]))
-
+ 
             if not response.get("IsTruncated"):
                 break
             continuation_token = response.get("NextContinuationToken")
-
+ 
         return objects
-
+ 
     def delete_prefix(self, prefix_uri: str) -> int:
         object_uris = self.list_objects(prefix_uri)
         if not object_uris:
             return 0
-
+ 
         bucket, _ = parse_s3_uri(prefix_uri)
         for index in range(0, len(object_uris), 1000):
             batch = object_uris[index:index + 1000]
@@ -172,7 +172,7 @@ class S3StorageManager:
                 },
             )
         return len(object_uris)
-
+ 
     def write_json(self, destination_uri: str, payload: dict[str, Any]) -> str:
         bucket, key = parse_s3_uri(destination_uri)
         self.client.put_object(
@@ -182,7 +182,7 @@ class S3StorageManager:
             ContentType="application/json",
         )
         return destination_uri
-
+ 
     def promote_run_prefix(
         self,
         run_prefix_uri: str,
@@ -194,13 +194,13 @@ class S3StorageManager:
         source_objects = self.list_objects(run_prefix_uri)
         if not source_objects:
             raise RuntimeError(f"No S3 objects found under run prefix: {run_prefix_uri}")
-
+ 
         removed_count = self.delete_prefix(current_prefix_uri)
         copied_count = 0
-
+ 
         source_bucket, source_prefix = parse_s3_uri(run_prefix_uri)
         current_bucket, current_prefix = parse_s3_uri(current_prefix_uri)
-
+ 
         for source_uri in source_objects:
             _, source_key = parse_s3_uri(source_uri)
             relative_key = source_key[len(source_prefix):].lstrip("/")
@@ -213,7 +213,7 @@ class S3StorageManager:
                 CopySource={"Bucket": source_bucket, "Key": source_key},
             )
             copied_count += 1
-
+ 
         marker_payload = {
             "run_id": run_id,
             "promoted_at": datetime.now(UTC).isoformat(),
@@ -225,3 +225,5 @@ class S3StorageManager:
             "removed_count": removed_count,
             "marker_uri": marker_uri,
         }
+ 
+ 
