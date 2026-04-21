@@ -20,6 +20,7 @@ PROPOSAL_CORE_SOURCES = ("amazon", "yelp", "ebay", "ifixit", "youtube")
 OPTIONAL_SOURCES = ("reddit",)
 
 AMAZON_FILE_CANDIDATES = (
+    "amazon/current",
     "amazon_electronics_sample.jsonl",
     "amazon/amazon_electronics_sample.jsonl",
     "amazon/amazon_reviews.jsonl",
@@ -364,17 +365,28 @@ def normalize_youtube(raw: Mapping[str, Any]) -> dict[str, Any]:
 
 def load_jsonl(path: Path, limit: Optional[int] = None) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
-    with path.open("r", encoding="utf-8") as handle:
-        for index, line in enumerate(handle):
-            if limit is not None and index >= limit:
-                break
-            payload = line.strip()
-            if not payload:
-                continue
-            try:
-                records.append(json.loads(payload))
-            except json.JSONDecodeError:
-                continue
+    input_paths = [path]
+    if path.is_dir():
+        input_paths = sorted(
+            candidate.resolve()
+            for candidate in path.iterdir()
+            if candidate.is_file() and candidate.suffix.lower() == ".jsonl"
+        )
+
+    loaded = 0
+    for input_path in input_paths:
+        with input_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if limit is not None and loaded >= limit:
+                    return records
+                payload = line.strip()
+                if not payload:
+                    continue
+                try:
+                    records.append(json.loads(payload))
+                    loaded += 1
+                except json.JSONDecodeError:
+                    continue
     return records
 
 
@@ -393,6 +405,65 @@ def find_first_existing_path(base_dir: Path, candidates: Sequence[str]) -> Optio
         if path.exists():
             return path
     return None
+
+
+def _directory_has_jsonl_files(path: Path) -> bool:
+    if not path.exists() or not path.is_dir():
+        return False
+    return any(candidate.is_file() and candidate.suffix.lower() == ".jsonl" for candidate in path.iterdir())
+
+
+def _load_json_file(path: Path) -> dict[str, Any] | None:
+    if not path.exists() or not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def resolve_amazon_source_path(base_dir: Path) -> Optional[Path]:
+    direct_path = find_first_existing_path(base_dir, AMAZON_FILE_CANDIDATES)
+    if direct_path is not None:
+        if direct_path.is_dir():
+            if _directory_has_jsonl_files(direct_path):
+                return direct_path
+        else:
+            return direct_path
+
+    runs_dir = (base_dir / "amazon" / "runs").resolve()
+    if not runs_dir.exists() or not runs_dir.is_dir():
+        return None
+
+    latest_completed: tuple[float, Path] | None = None
+    for run_dir in runs_dir.iterdir():
+        if not run_dir.is_dir():
+            continue
+        if not any(run_dir.glob("amazon_reviews_batch_*.jsonl")):
+            continue
+
+        checkpoint_payload = _load_json_file(run_dir / "_checkpoint.json") or {}
+        manifest_exists = (run_dir / "manifest.json").exists()
+        if not manifest_exists and not checkpoint_payload.get("completed"):
+            continue
+
+        sort_key = max(
+            run_dir.stat().st_mtime,
+            (run_dir / "_checkpoint.json").stat().st_mtime if (run_dir / "_checkpoint.json").exists() else 0.0,
+            (run_dir / "manifest.json").stat().st_mtime if (run_dir / "manifest.json").exists() else 0.0,
+        )
+        candidate = (sort_key, run_dir.resolve())
+        if latest_completed is None or candidate[0] > latest_completed[0]:
+            latest_completed = candidate
+
+    return latest_completed[1] if latest_completed else None
+
+
+def resolve_source_input_path(base_dir: Path, source: str, candidates: Sequence[str]) -> Optional[Path]:
+    if source == "amazon":
+        return resolve_amazon_source_path(base_dir)
+    return find_first_existing_path(base_dir, candidates)
 
 
 def _write_jsonl(path: Path, records: Sequence[Mapping[str, Any]]) -> None:
@@ -526,7 +597,7 @@ def run_local_normalization(
         status="started",
     )
 
-    amazon_path = find_first_existing_path(settings.data_dir, AMAZON_FILE_CANDIDATES)
+    amazon_path = resolve_source_input_path(settings.data_dir, "amazon", AMAZON_FILE_CANDIDATES)
     if amazon_path:
         source_started_at = time.perf_counter()
         log_event(

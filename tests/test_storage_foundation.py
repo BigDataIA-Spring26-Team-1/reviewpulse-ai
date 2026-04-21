@@ -110,6 +110,44 @@ def test_promote_run_prefix_replaces_current_and_writes_latest_marker():
         assert marker_payload["stage"] == "normalized_jsonl"
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_promote_run_prefix_reports_progress():
+    resolver = S3PathResolver(bucket="reviewpulse-bucket", raw_prefix="raw", processed_prefix="processed")
+    client = FakeS3Client()
+    manager = S3StorageManager(resolver, client)
+
+    temp_dir = Path(__file__).resolve().parent / "_tmp_storage_foundation_progress"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        run_prefix = resolver.raw_run_prefix("amazon", "run_123")
+        current_prefix = resolver.raw_current_prefix("amazon")
+
+        local_files = []
+        for index in range(3):
+            local_file = temp_dir / f"batch_{index + 1}.jsonl"
+            local_file.write_text(f'{{"review_id": "{index + 1}"}}\n', encoding="utf-8")
+            local_files.append(local_file)
+            manager.upload_file(local_file, run_prefix + local_file.name)
+
+        progress_events: list[dict[str, int]] = []
+        result = manager.promote_run_prefix(
+            run_prefix,
+            current_prefix,
+            run_id="run_123",
+            metadata={"source": "amazon", "stage": "ingest_amazon", "status": "success"},
+            progress_callback=progress_events.append,
+            progress_interval=2,
+        )
+
+        assert result["copied_count"] == 3
+        assert progress_events == [
+            {"copied_count": 1, "removed_count": 0, "total_objects": 3},
+            {"copied_count": 2, "removed_count": 0, "total_objects": 3},
+            {"copied_count": 3, "removed_count": 0, "total_objects": 3},
+        ]
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
  
  
 def test_structured_logging_emits_json_events():

@@ -19,6 +19,7 @@ from src.normalization.core import (
     normalize_ifixit,
     normalize_yelp,
     normalize_youtube,
+    resolve_source_input_path,
 )
  
  
@@ -95,7 +96,7 @@ def _normalize_source_row(source: str, raw_row: dict[str, Any]) -> dict[str, Any
  
 def _load_sample_raw_row(source: str, sample_index: int = 0) -> tuple[dict[str, Any] | None, Path | None]:
     settings = get_settings()
-    raw_path = find_first_existing_path(settings.data_dir, _source_candidates(source))
+    raw_path = resolve_source_input_path(settings.data_dir, source, _source_candidates(source))
     if raw_path is None:
         return None, None
  

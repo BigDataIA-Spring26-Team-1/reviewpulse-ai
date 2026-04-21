@@ -1,8 +1,9 @@
 """S3 storage helpers for run-based pipeline publishing."""
- 
+
 from __future__ import annotations
- 
+
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -190,17 +191,20 @@ class S3StorageManager:
         *,
         run_id: str,
         metadata: dict[str, Any] | None = None,
+        progress_callback: Callable[[dict[str, int]], None] | None = None,
+        progress_interval: int = 100,
     ) -> dict[str, Any]:
         source_objects = self.list_objects(run_prefix_uri)
         if not source_objects:
             raise RuntimeError(f"No S3 objects found under run prefix: {run_prefix_uri}")
- 
+
+        total_objects = len(source_objects)
         removed_count = self.delete_prefix(current_prefix_uri)
         copied_count = 0
- 
+
         source_bucket, source_prefix = parse_s3_uri(run_prefix_uri)
         current_bucket, current_prefix = parse_s3_uri(current_prefix_uri)
- 
+
         for source_uri in source_objects:
             _, source_key = parse_s3_uri(source_uri)
             relative_key = source_key[len(source_prefix):].lstrip("/")
@@ -213,7 +217,19 @@ class S3StorageManager:
                 CopySource={"Bucket": source_bucket, "Key": source_key},
             )
             copied_count += 1
- 
+            if progress_callback and (
+                copied_count == total_objects
+                or copied_count == 1
+                or copied_count % max(1, progress_interval) == 0
+            ):
+                progress_callback(
+                    {
+                        "copied_count": copied_count,
+                        "removed_count": removed_count,
+                        "total_objects": total_objects,
+                    }
+                )
+
         marker_payload = {
             "run_id": run_id,
             "promoted_at": datetime.now(UTC).isoformat(),

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -21,6 +23,7 @@ from src.normalization.core import (
     normalize_reddit,
     normalize_yelp,
     normalize_youtube,
+    resolve_amazon_source_path,
 )
 
 
@@ -80,6 +83,31 @@ class TestAmazonNormalization:
         )
         assert result["review_text"] == ""
         assert result["text_length_words"] == 0
+
+    def test_resolve_amazon_source_path_falls_back_to_latest_completed_run_dir(self):
+        workspace = Path(__file__).resolve().parent / "_tmp_normalization" / "amazon_latest_run"
+        shutil.rmtree(workspace, ignore_errors=True)
+        try:
+            run_dir = workspace / "amazon" / "runs" / "run_test"
+            run_dir.mkdir(parents=True, exist_ok=True)
+            (run_dir / "amazon_reviews_batch_000001_records_00000001.jsonl").write_text(
+                '{"asin":"B001","user_id":"u1","rating":5.0}\n',
+                encoding="utf-8",
+            )
+            (run_dir / "manifest.json").write_text(
+                json.dumps({"total_batches": 1, "total_records": 1}),
+                encoding="utf-8",
+            )
+            (run_dir / "_checkpoint.json").write_text(
+                json.dumps({"completed": True, "cumulative_records": 1}),
+                encoding="utf-8",
+            )
+
+            resolved = resolve_amazon_source_path(workspace)
+
+            assert resolved == run_dir.resolve()
+        finally:
+            shutil.rmtree(workspace, ignore_errors=True)
 
 
 class TestYelpNormalization:
