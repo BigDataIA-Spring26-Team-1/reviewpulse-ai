@@ -74,6 +74,7 @@ class Settings:
     huggingface_token: str
     amazon_dataset_name: str
     amazon_category: str
+    amazon_batch_size: int
     amazon_max_records: int
     yelp_dataset_path: Path | None
     ebay_app_id: str
@@ -135,7 +136,8 @@ def get_settings() -> Settings:
         huggingface_token=os.getenv("HUGGINGFACE_TOKEN", "").strip(),
         amazon_dataset_name=os.getenv("AMAZON_DATASET_NAME", "McAuley-Lab/Amazon-Reviews-2023").strip(),
         amazon_category=os.getenv("AMAZON_CATEGORY", "Electronics").strip(),
-        amazon_max_records=_int_env("AMAZON_MAX_RECORDS", 5000),
+        amazon_batch_size=_int_env("AMAZON_BATCH_SIZE", 10000),
+        amazon_max_records=_int_env("AMAZON_MAX_RECORDS", 0),
         yelp_dataset_path=_resolve_optional_project_path(os.getenv("YELP_DATASET_PATH", "")),
         ebay_app_id=os.getenv("EBAY_APP_ID", "").strip(),
         ebay_dev_id=os.getenv("EBAY_DEV_ID", "").strip(),

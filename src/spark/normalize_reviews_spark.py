@@ -89,6 +89,7 @@ from src.normalization.core import (
     YELP_REVIEW_FILE_CANDIDATES,
     YOUTUBE_FILE_CANDIDATES,
     find_first_existing_path,
+    resolve_source_input_path,
 )
 
 
@@ -107,9 +108,19 @@ def build_spark() -> Any:
 
 def _read_json(spark: Any, candidates: tuple[str, ...]) -> tuple[Any | None, Path | None]:
     settings = get_settings()
-    path = find_first_existing_path(settings.data_dir, candidates)
+    source_name = "amazon" if candidates == AMAZON_FILE_CANDIDATES else ""
+    path = resolve_source_input_path(settings.data_dir, source_name, candidates)
     if not path:
         return None, None
+    if path.is_dir():
+        jsonl_paths = sorted(
+            str(candidate.resolve())
+            for candidate in path.iterdir()
+            if candidate.is_file() and candidate.suffix.lower() == ".jsonl"
+        )
+        if not jsonl_paths:
+            return None, path
+        return spark.read.json(jsonl_paths), path
     return spark.read.json(str(path)), path
 
 
