@@ -16,12 +16,14 @@ fastapi = "^0.115.12"
 uvicorn = { version = "^0.34.2", extras = ["standard"] }
 streamlit = "^1.44.1"
 pyspark = "^4.0.0"
+boto3 = "^1.37.38"
 sentence-transformers = "^4.1.0"
 chromadb = "^1.0.8"
 anthropic = "^0.52.2"
 python-dotenv = "^1.1.0"
 praw = "^7.8.1"
 youtube-transcript-api = "^1.0.3"
+datasets = "^3.5.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.5"
@@ -31,6 +33,7 @@ mypy = "^1.15.0"
 
 [tool.pytest.ini_options]
 addopts = "-p no:cacheprovider"
+testpaths = ["tests"]
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]

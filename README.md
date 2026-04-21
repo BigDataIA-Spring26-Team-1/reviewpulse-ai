@@ -21,11 +21,11 @@ The system answers questions like:
 - "How does the Fairphone 5 compare to the iPhone 15 on repairability?"
 - "What do reviews say about customer service?"
 
-This project is data-first. The ingestion, schema normalization, cleaning, sentiment scoring, and retrieval pipeline are the core of the MVP. The LLM-backed answer generation is optional and sits on top of that pipeline.
+This project is data-first. The ingestion, schema normalization, cleaning, sentiment scoring, and retrieval pipeline are the core of the system. The LLM-backed answer generation is optional and sits on top of that pipeline.
 
 ---
 
-## Current MVP Architecture
+## Current Architecture
 
 The checked-in repository currently implements this flow:
 
@@ -52,9 +52,9 @@ Amazon/eBay/Yelp/iFixit/YouTube/Reddit
     -> Streamlit
 ```
 
-### Note on the proposal diagrams
+### Note on the project diagrams
 
-The proposal artifacts describe larger target architectures involving cloud storage, warehouses, and caches. The current repository is a local MVP implementation and does not currently wire up BigQuery, Snowflake, Redis, S3, or Gemini in the checked-in application code.
+The project diagrams describe a larger target architecture involving cloud storage, warehouses, and caches. The current repository runs locally and does not currently wire up BigQuery, Snowflake, Redis, S3, or Gemini in the checked-in application code.
 
 ---
 
@@ -111,7 +111,7 @@ Normalization formulas:
 | Tool | Why This |
 |------|----------|
 | PySpark | Handles normalization and parquet processing consistently across larger datasets |
-| Local filesystem + parquet | Matches the current MVP and keeps local setup simple |
+| Local filesystem + parquet | Matches the current repository and keeps local setup simple |
 | Ollama + Llama 3.1 | Free local option for aspect extraction POC |
 | Anthropic API (optional) | Improves grounded chat answers when configured |
 | sentence-transformers | Local embeddings for semantic retrieval |
@@ -310,11 +310,11 @@ What the LLM does not do:
 
 ## Current Limitations
 
-- Amazon data in the current MVP uses a sample subset, not the full 571M-review corpus
+- Amazon data in the current repository uses a sample subset, not the full 571M-review corpus
 - eBay and iFixit pipelines are still POC-oriented rather than production crawlers
 - Sentiment scoring is a lightweight baseline rather than a production classifier
 - Retrieval quality depends on source text and metadata quality
-- The larger cloud architecture from the proposal is not fully wired in this repository yet
+- The larger cloud architecture from the project diagrams is not fully wired in this repository yet
 
 ---
 

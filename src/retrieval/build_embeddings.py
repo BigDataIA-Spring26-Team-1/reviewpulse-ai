@@ -8,9 +8,11 @@ Run:
 from __future__ import annotations
 
 import importlib
+import logging
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +22,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.common.settings import get_settings
+from src.common.storage import S3StorageManager
+from src.common.structured_logging import configure_structured_logging, get_logger, log_event
+from src.common.run_context import build_run_context
 
 
 DEPENDENCY_SETUP_HINT = (
@@ -74,15 +79,37 @@ def build_spark() -> Any:
 
 def main() -> None:
     settings = get_settings()
+    configure_structured_logging(settings.log_level)
+    logger = get_logger("retrieval.build_embeddings")
+    run_context = build_run_context(stage="build_embeddings")
+    started_at = time.perf_counter()
+    storage_manager = S3StorageManager.from_settings(settings)
 
-    print("=" * 60)
-    print("REVIEWPULSE AI BUILD EMBEDDINGS")
-    print("=" * 60)
+    log_event(
+        logger,
+        "pipeline_run_started",
+        stage=run_context.stage,
+        run_id=run_context.run_id,
+        dag_id=run_context.dag_id,
+        task_id=run_context.task_id,
+        status="started",
+    )
 
     if not settings.sentiment_parquet_path.exists():
-        print(f"Input parquet not found: {settings.sentiment_parquet_path}")
-        print("Run sentiment scoring first.")
-        return
+        log_event(
+            logger,
+            "embeddings_generation_failed",
+            level=logging.ERROR,
+            stage=run_context.stage,
+            run_id=run_context.run_id,
+            dag_id=run_context.dag_id,
+            task_id=run_context.task_id,
+            input_path=str(settings.sentiment_parquet_path),
+            status="failed",
+            error_type="MissingInputError",
+            error_message="Sentiment parquet not found. Run sentiment scoring first.",
+        )
+        raise RuntimeError("Sentiment parquet not found. Run sentiment scoring first.")
 
     spark = build_spark()
     df = spark.read.parquet(str(settings.sentiment_parquet_path))
@@ -98,9 +125,6 @@ def main() -> None:
     df = amazon_df.unionByName(yelp_df)
     for source_df in [ebay_df, ifixit_df, youtube_df, reddit_df]:
         df = df.unionByName(source_df)
-
-    print("\nEmbedding subset counts by source:")
-    df.groupBy("source").count().orderBy("source").show(truncate=False)
 
     rows = df.select(
         "review_id",
@@ -120,8 +144,19 @@ def main() -> None:
     spark.stop()
 
     if not rows:
-        print("No rows found for embedding.")
-        return
+        log_event(
+            logger,
+            "embeddings_generation_failed",
+            level=logging.ERROR,
+            stage=run_context.stage,
+            run_id=run_context.run_id,
+            dag_id=run_context.dag_id,
+            task_id=run_context.task_id,
+            status="failed",
+            error_type="EmptyDatasetError",
+            error_message="No rows found for embedding.",
+        )
+        raise RuntimeError("No rows found for embedding.")
 
     documents: list[str] = []
     ids: list[str] = []
@@ -149,20 +184,25 @@ def main() -> None:
             }
         )
 
-    print(f"Documents to embed: {len(documents)}")
-
     model_name = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-    print(f"Loading embedding model: {model_name}")
     SentenceTransformer = _require_sentence_transformer()
     model = SentenceTransformer(model_name)
 
-    print("Generating embeddings...")
+    log_event(
+        logger,
+        "embeddings_generation_started",
+        stage=run_context.stage,
+        run_id=run_context.run_id,
+        dag_id=run_context.dag_id,
+        task_id=run_context.task_id,
+        record_count=len(documents),
+        status="started",
+    )
     embeddings = model.encode(documents, batch_size=64, show_progress_bar=True)
 
     if settings.chroma_path.exists():
         shutil.rmtree(settings.chroma_path)
 
-    print("Creating ChromaDB collection...")
     chromadb = _require_chromadb()
     client = chromadb.PersistentClient(path=str(settings.chroma_path))
     collection = client.get_or_create_collection(
@@ -177,11 +217,62 @@ def main() -> None:
             embeddings=embeddings[index:index + batch_size].tolist(),
             metadatas=metadatas[index:index + batch_size],
         )
-        print(f"Loaded batch {index} to {min(index + batch_size, len(documents))}")
+    run_prefix = storage_manager.resolver.processed_run_prefix("chromadb", run_context.run_id)
+    current_prefix = storage_manager.resolver.processed_current_prefix("chromadb")
 
-    print("\nDone.")
-    print(f"ChromaDB stored at: {settings.chroma_path}")
-    print(f"Collection count: {collection.count()}")
+    log_event(
+        logger,
+        "s3_upload_started",
+        stage="chromadb",
+        run_id=run_context.run_id,
+        dag_id=run_context.dag_id,
+        task_id=run_context.task_id,
+        input_path=str(settings.chroma_path),
+        output_path=run_prefix,
+        status="started",
+    )
+    uploaded = storage_manager.upload_directory(settings.chroma_path, run_prefix)
+    log_event(
+        logger,
+        "s3_upload_completed",
+        stage="chromadb",
+        run_id=run_context.run_id,
+        dag_id=run_context.dag_id,
+        task_id=run_context.task_id,
+        input_path=str(settings.chroma_path),
+        output_path=run_prefix,
+        file_count=len(uploaded),
+        status="success",
+    )
+    promotion = storage_manager.promote_run_prefix(
+        run_prefix,
+        current_prefix,
+        run_id=run_context.run_id,
+        metadata={"stage": "chromadb", "status": "success"},
+    )
+    log_event(
+        logger,
+        "latest_run_promoted",
+        stage="chromadb",
+        run_id=run_context.run_id,
+        dag_id=run_context.dag_id,
+        task_id=run_context.task_id,
+        output_path=current_prefix,
+        file_count=promotion["copied_count"],
+        status="success",
+    )
+    log_event(
+        logger,
+        "embeddings_generation_completed",
+        stage=run_context.stage,
+        run_id=run_context.run_id,
+        dag_id=run_context.dag_id,
+        task_id=run_context.task_id,
+        record_count=len(documents),
+        output_path=str(settings.chroma_path),
+        duration_ms=round((time.perf_counter() - started_at) * 1000, 2),
+        status="success",
+    )
 
 
 if __name__ == "__main__":
