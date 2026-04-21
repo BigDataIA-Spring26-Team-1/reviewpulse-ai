@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 try:
     from dotenv import load_dotenv
@@ -25,9 +26,38 @@ def _resolve_project_path(value: str, default: str) -> Path:
     return (PROJECT_ROOT / path).resolve()
 
 
+def _resolve_optional_project_path(value: str) -> Optional[Path]:
+    raw_value = value.strip()
+    if not raw_value:
+        return None
+    path = Path(raw_value)
+    if path.is_absolute():
+        return path.resolve()
+    return (PROJECT_ROOT / path).resolve()
+
+
+def _csv_env(name: str) -> tuple[str, ...]:
+    raw_value = os.getenv(name, "")
+    values = [part.strip() for part in raw_value.replace("\n", ",").split(",")]
+    return tuple(value for value in values if value)
+
+
+def _int_env(name: str, default: int) -> int:
+    raw_value = os.getenv(name, "").strip()
+    if not raw_value:
+        return default
+    try:
+        return int(raw_value)
+    except ValueError:
+        return default
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     project_root: Path
+    app_name: str
+    app_env: str
+    log_level: str
     data_dir: Path
     raw_data_dir: Path
     processed_data_dir: Path
@@ -35,8 +65,33 @@ class Settings:
     normalized_parquet_path: Path
     sentiment_parquet_path: Path
     chroma_path: Path
+    aws_region: str
+    s3_bucket_name: str
+    s3_raw_prefix: str
+    s3_processed_prefix: str
     spark_master: str
     spark_sql_session_timezone: str
+    huggingface_token: str
+    amazon_dataset_name: str
+    amazon_category: str
+    amazon_max_records: int
+    yelp_dataset_path: Path | None
+    ebay_app_id: str
+    ebay_dev_id: str
+    ebay_cert_id: str
+    ebay_site_id: str
+    ebay_marketplace_id: str
+    ebay_search_queries: tuple[str, ...]
+    ebay_max_items_per_query: int
+    ifixit_base_url: str
+    ifixit_guide_ids: tuple[str, ...]
+    youtube_api_key: str
+    youtube_video_ids: tuple[str, ...]
+    youtube_transcript_languages: tuple[str, ...]
+
+    @property
+    def s3_enabled(self) -> bool:
+        return bool(self.s3_bucket_name.strip())
 
 
 def get_settings() -> Settings:
@@ -61,6 +116,9 @@ def get_settings() -> Settings:
 
     return Settings(
         project_root=PROJECT_ROOT,
+        app_name=os.getenv("APP_NAME", "ReviewPulse AI"),
+        app_env=os.getenv("APP_ENV", "development"),
+        log_level=os.getenv("LOG_LEVEL", "INFO"),
         data_dir=data_dir,
         raw_data_dir=raw_data_dir,
         processed_data_dir=processed_data_dir,
@@ -68,6 +126,27 @@ def get_settings() -> Settings:
         normalized_parquet_path=normalized_parquet_path,
         sentiment_parquet_path=sentiment_parquet_path,
         chroma_path=chroma_path,
+        aws_region=os.getenv("AWS_REGION", "us-east-1"),
+        s3_bucket_name=os.getenv("S3_BUCKET_NAME", "").strip(),
+        s3_raw_prefix=os.getenv("S3_RAW_PREFIX", "raw"),
+        s3_processed_prefix=os.getenv("S3_PROCESSED_PREFIX", "processed"),
         spark_master=os.getenv("SPARK_MASTER", "local[*]"),
         spark_sql_session_timezone=os.getenv("SPARK_SQL_SESSION_TIMEZONE", "UTC"),
+        huggingface_token=os.getenv("HUGGINGFACE_TOKEN", "").strip(),
+        amazon_dataset_name=os.getenv("AMAZON_DATASET_NAME", "McAuley-Lab/Amazon-Reviews-2023").strip(),
+        amazon_category=os.getenv("AMAZON_CATEGORY", "Electronics").strip(),
+        amazon_max_records=_int_env("AMAZON_MAX_RECORDS", 5000),
+        yelp_dataset_path=_resolve_optional_project_path(os.getenv("YELP_DATASET_PATH", "")),
+        ebay_app_id=os.getenv("EBAY_APP_ID", "").strip(),
+        ebay_dev_id=os.getenv("EBAY_DEV_ID", "").strip(),
+        ebay_cert_id=os.getenv("EBAY_CERT_ID", "").strip(),
+        ebay_site_id=os.getenv("EBAY_SITE_ID", "0").strip(),
+        ebay_marketplace_id=os.getenv("EBAY_MARKETPLACE_ID", "EBAY_US").strip(),
+        ebay_search_queries=_csv_env("EBAY_SEARCH_QUERIES"),
+        ebay_max_items_per_query=_int_env("EBAY_MAX_ITEMS_PER_QUERY", 50),
+        ifixit_base_url=os.getenv("IFIXIT_BASE_URL", "https://www.ifixit.com").strip(),
+        ifixit_guide_ids=_csv_env("IFIXIT_GUIDE_IDS"),
+        youtube_api_key=os.getenv("YOUTUBE_API_KEY", "").strip(),
+        youtube_video_ids=_csv_env("YOUTUBE_VIDEO_IDS"),
+        youtube_transcript_languages=_csv_env("YOUTUBE_TRANSCRIPT_LANGUAGES") or ("en",),
     )

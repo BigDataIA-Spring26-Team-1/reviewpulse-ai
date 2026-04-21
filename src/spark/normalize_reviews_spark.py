@@ -1,7 +1,7 @@
 """
 ReviewPulse AI Spark normalization pipeline.
 
-This is the proposal-aligned normalization stage for the MVP core sources:
+This is the normalization stage for the core sources:
 Amazon, Yelp, eBay, iFixit, and YouTube. Reddit remains optional.
 
 Run:
@@ -11,8 +11,10 @@ Run:
 from __future__ import annotations
 
 import importlib
+import logging
 import shutil
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -75,6 +77,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.common.settings import get_settings
+from src.common.storage import S3StorageManager
+from src.common.structured_logging import configure_structured_logging, get_logger, log_event
+from src.common.run_context import PipelineRunContext, build_run_context
 from src.normalization.core import (
     AMAZON_FILE_CANDIDATES,
     EBAY_FILE_CANDIDATES,
@@ -333,17 +338,80 @@ def deduplicate_exact_reviews(df: Any) -> Any:
     before_count = df.count()
     deduplicated = df.dropDuplicates(["review_id"])
     removed = before_count - deduplicated.count()
-    print(f"Removed {removed} exact duplicate reviews")
     return deduplicated
+
+
+def _publish_normalized_parquet(
+    storage_manager: S3StorageManager,
+    logger: logging.Logger,
+    run_context: PipelineRunContext,
+    output_path: Path,
+) -> None:
+    run_prefix = storage_manager.resolver.processed_run_prefix("normalized_parquet", run_context.run_id)
+    current_prefix = storage_manager.resolver.processed_current_prefix("normalized_parquet")
+
+    log_event(
+        logger,
+        "s3_upload_started",
+        stage="normalized_parquet",
+        run_id=run_context.run_id,
+        dag_id=run_context.dag_id,
+        task_id=run_context.task_id,
+        input_path=str(output_path),
+        output_path=run_prefix,
+        status="started",
+    )
+    uploaded = storage_manager.upload_directory(output_path, run_prefix)
+    log_event(
+        logger,
+        "s3_upload_completed",
+        stage="normalized_parquet",
+        run_id=run_context.run_id,
+        dag_id=run_context.dag_id,
+        task_id=run_context.task_id,
+        input_path=str(output_path),
+        output_path=run_prefix,
+        file_count=len(uploaded),
+        status="success",
+    )
+
+    promotion = storage_manager.promote_run_prefix(
+        run_prefix,
+        current_prefix,
+        run_id=run_context.run_id,
+        metadata={"stage": "normalized_parquet", "status": "success"},
+    )
+    log_event(
+        logger,
+        "latest_run_promoted",
+        stage="normalized_parquet",
+        run_id=run_context.run_id,
+        dag_id=run_context.dag_id,
+        task_id=run_context.task_id,
+        output_path=current_prefix,
+        file_count=promotion["copied_count"],
+        status="success",
+    )
 
 
 def main() -> None:
     settings = get_settings()
+    configure_structured_logging(settings.log_level)
+    logger = get_logger("spark.normalize_reviews")
+    run_context = build_run_context(stage="normalize_reviews_spark")
+    started_at = time.perf_counter()
+    storage_manager = S3StorageManager.from_settings(settings)
     spark = build_spark()
 
-    print("=" * 60)
-    print("REVIEWPULSE AI SPARK NORMALIZATION PIPELINE")
-    print("=" * 60)
+    log_event(
+        logger,
+        "pipeline_run_started",
+        stage=run_context.stage,
+        run_id=run_context.run_id,
+        dag_id=run_context.dag_id,
+        task_id=run_context.task_id,
+        status="started",
+    )
 
     loaders = [
         normalize_amazon,
@@ -358,44 +426,110 @@ def main() -> None:
     for loader in loaders:
         dataframe, source_path = loader(spark)
         if dataframe is not None:
-            print(f"Loaded {loader.__name__.replace('normalize_', '')} input from {source_path}")
+            source_name = loader.__name__.replace("normalize_", "")
+            source_count = dataframe.count()
+            log_event(
+                logger,
+                "source_fetch_completed",
+                source=source_name,
+                stage=run_context.stage,
+                run_id=run_context.run_id,
+                dag_id=run_context.dag_id,
+                task_id=run_context.task_id,
+                input_path=str(source_path),
+                record_count=source_count,
+                status="success",
+            )
             dataframes.append(dataframe)
 
     if not dataframes:
-        print("No input source files were found.")
         spark.stop()
-        return
+        log_event(
+            logger,
+            "normalization_failed",
+            level=logging.ERROR,
+            stage=run_context.stage,
+            run_id=run_context.run_id,
+            dag_id=run_context.dag_id,
+            task_id=run_context.task_id,
+            status="failed",
+            error_type="MissingInputError",
+            error_message="No input source files were found for Spark normalization.",
+        )
+        raise RuntimeError("No input source files were found for Spark normalization.")
 
     unified_df = dataframes[0]
     for dataframe in dataframes[1:]:
         unified_df = unified_df.unionByName(dataframe)
 
+    feature_started_at = time.perf_counter()
+    log_event(
+        logger,
+        "feature_engineering_started",
+        stage=run_context.stage,
+        run_id=run_context.run_id,
+        dag_id=run_context.dag_id,
+        task_id=run_context.task_id,
+        status="started",
+    )
     unified_df = add_feature_columns(unified_df)
+    log_event(
+        logger,
+        "feature_engineering_completed",
+        stage=run_context.stage,
+        run_id=run_context.run_id,
+        dag_id=run_context.dag_id,
+        task_id=run_context.task_id,
+        duration_ms=round((time.perf_counter() - feature_started_at) * 1000, 2),
+        status="success",
+    )
+
+    dedup_started_at = time.perf_counter()
+    pre_dedup_count = unified_df.count()
+    log_event(
+        logger,
+        "dedup_started",
+        stage=run_context.stage,
+        run_id=run_context.run_id,
+        dag_id=run_context.dag_id,
+        task_id=run_context.task_id,
+        record_count=pre_dedup_count,
+        status="started",
+    )
     unified_df = deduplicate_exact_reviews(unified_df)
-
-    print("\nSchema:")
-    unified_df.printSchema()
-
-    print("\nRecord counts by source:")
-    unified_df.groupBy("source").count().orderBy("source").show(truncate=False)
-
-    print("\nAverage normalized rating by source:")
-    unified_df.groupBy("source").avg("rating_normalized").orderBy("source").show(truncate=False)
-
-    print("\nAverage feature values by source:")
-    unified_df.groupBy("source").avg("text_length_words", "caps_ratio", "exclamation_ratio").orderBy("source").show(truncate=False)
+    post_dedup_count = unified_df.count()
+    log_event(
+        logger,
+        "dedup_completed",
+        stage=run_context.stage,
+        run_id=run_context.run_id,
+        dag_id=run_context.dag_id,
+        task_id=run_context.task_id,
+        record_count=post_dedup_count,
+        duration_ms=round((time.perf_counter() - dedup_started_at) * 1000, 2),
+        status="success",
+    )
 
     if settings.normalized_parquet_path.exists():
         shutil.rmtree(settings.normalized_parquet_path)
 
     settings.normalized_parquet_path.parent.mkdir(parents=True, exist_ok=True)
     unified_df.write.mode("overwrite").parquet(str(settings.normalized_parquet_path))
-
-    print(f"\nSaved parquet output to: {settings.normalized_parquet_path}")
-    print("\nSample rows:")
-    unified_df.show(10, truncate=False)
+    _publish_normalized_parquet(storage_manager, logger, run_context, settings.normalized_parquet_path)
 
     spark.stop()
+    log_event(
+        logger,
+        "normalization_completed",
+        stage=run_context.stage,
+        run_id=run_context.run_id,
+        dag_id=run_context.dag_id,
+        task_id=run_context.task_id,
+        record_count=post_dedup_count,
+        output_path=str(settings.normalized_parquet_path),
+        duration_ms=round((time.perf_counter() - started_at) * 1000, 2),
+        status="success",
+    )
 
 
 if __name__ == "__main__":

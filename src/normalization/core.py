@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import json
+import logging
+import time
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
+from src.common.run_context import PipelineRunContext, build_run_context
 from src.common.settings import get_settings
+from src.common.storage import S3StorageManager
+from src.common.structured_logging import configure_structured_logging, get_logger, log_event
 
 
 PROPOSAL_CORE_SOURCES = ("amazon", "yelp", "ebay", "ifixit", "youtube")
@@ -17,13 +22,16 @@ OPTIONAL_SOURCES = ("reddit",)
 AMAZON_FILE_CANDIDATES = (
     "amazon_electronics_sample.jsonl",
     "amazon/amazon_electronics_sample.jsonl",
+    "amazon/amazon_reviews.jsonl",
 )
 YELP_REVIEW_FILE_CANDIDATES = (
     "yelp/yelp_academic_dataset_review.json",
+    "yelp/yelp_reviews.jsonl",
     "yelp_reviews.jsonl",
 )
 YELP_BUSINESS_FILE_CANDIDATES = (
     "yelp/yelp_academic_dataset_business.json",
+    "yelp/yelp_businesses.jsonl",
     "yelp_business.jsonl",
 )
 EBAY_FILE_CANDIDATES = (
@@ -35,11 +43,13 @@ EBAY_FILE_CANDIDATES = (
 IFIXIT_FILE_CANDIDATES = (
     "ifixit_reviews.jsonl",
     "ifixit/ifixit_reviews.jsonl",
+    "ifixit/ifixit_guides.jsonl",
     "ifixit/guides.jsonl",
 )
 YOUTUBE_FILE_CANDIDATES = (
     "youtube_reviews.jsonl",
     "youtube/youtube_reviews.jsonl",
+    "youtube/youtube_transcripts.jsonl",
 )
 REDDIT_FILE_CANDIDATES = (
     "reddit_reviews.jsonl",
@@ -398,22 +408,170 @@ def _average(values: Sequence[float]) -> float:
     return sum(values) / len(values)
 
 
-def run_local_normalization(include_optional_sources: bool = True) -> list[dict[str, Any]]:
+def _upload_raw_snapshot(
+    storage_manager: S3StorageManager,
+    logger: logging.Logger,
+    run_context: PipelineRunContext,
+    source_name: str,
+    source_path: Path,
+) -> str:
+    destination_uri = storage_manager.resolver.raw_run_prefix(source_name, run_context.run_id) + source_path.name
+    log_event(
+        logger,
+        "s3_upload_started",
+        source=source_name,
+        stage=run_context.stage,
+        run_id=run_context.run_id,
+        dag_id=run_context.dag_id,
+        task_id=run_context.task_id,
+        input_path=str(source_path),
+        output_path=destination_uri,
+        status="started",
+    )
+    storage_manager.upload_file(source_path, destination_uri)
+    log_event(
+        logger,
+        "s3_upload_completed",
+        source=source_name,
+        stage=run_context.stage,
+        run_id=run_context.run_id,
+        dag_id=run_context.dag_id,
+        task_id=run_context.task_id,
+        input_path=str(source_path),
+        output_path=destination_uri,
+        file_count=1,
+        status="success",
+    )
+    return destination_uri
+
+
+def _publish_normalized_output(
+    storage_manager: S3StorageManager,
+    logger: logging.Logger,
+    run_context: PipelineRunContext,
+    local_output_path: Path,
+) -> dict[str, Any]:
+    run_prefix = storage_manager.resolver.processed_run_prefix("normalized_jsonl", run_context.run_id)
+    current_prefix = storage_manager.resolver.processed_current_prefix("normalized_jsonl")
+    destination_uri = run_prefix + local_output_path.name
+
+    log_event(
+        logger,
+        "s3_upload_started",
+        stage="normalized_jsonl",
+        run_id=run_context.run_id,
+        dag_id=run_context.dag_id,
+        task_id=run_context.task_id,
+        input_path=str(local_output_path),
+        output_path=destination_uri,
+        status="started",
+    )
+    storage_manager.upload_file(local_output_path, destination_uri)
+    log_event(
+        logger,
+        "s3_upload_completed",
+        stage="normalized_jsonl",
+        run_id=run_context.run_id,
+        dag_id=run_context.dag_id,
+        task_id=run_context.task_id,
+        input_path=str(local_output_path),
+        output_path=destination_uri,
+        file_count=1,
+        status="success",
+    )
+    promotion = storage_manager.promote_run_prefix(
+        run_prefix,
+        current_prefix,
+        run_id=run_context.run_id,
+        metadata={"stage": "normalized_jsonl", "status": "success"},
+    )
+    log_event(
+        logger,
+        "latest_run_promoted",
+        stage="normalized_jsonl",
+        run_id=run_context.run_id,
+        dag_id=run_context.dag_id,
+        task_id=run_context.task_id,
+        output_path=current_prefix,
+        file_count=promotion["copied_count"],
+        status="success",
+    )
+    return promotion
+
+
+def run_local_normalization(
+    include_optional_sources: bool = True,
+    *,
+    run_context: PipelineRunContext | None = None,
+    logger: logging.Logger | None = None,
+    storage_manager: S3StorageManager | None = None,
+) -> list[dict[str, Any]]:
     settings = get_settings()
+    run_context = run_context or build_run_context(stage="normalize_local_preview")
+    logger = logger or get_logger("normalization.local")
+    storage_manager = storage_manager or S3StorageManager.from_settings(settings)
+
     normalized_records: list[dict[str, Any]] = []
     source_counts: dict[str, int] = {}
+    available_sources: list[tuple[str, Path]] = []
+    raw_sources_for_promotion: list[str] = []
+
+    log_event(
+        logger,
+        "normalization_started",
+        stage=run_context.stage,
+        run_id=run_context.run_id,
+        dag_id=run_context.dag_id,
+        task_id=run_context.task_id,
+        status="started",
+    )
 
     amazon_path = find_first_existing_path(settings.data_dir, AMAZON_FILE_CANDIDATES)
     if amazon_path:
+        source_started_at = time.perf_counter()
+        log_event(
+            logger,
+            "source_fetch_started",
+            source="amazon",
+            stage=run_context.stage,
+            run_id=run_context.run_id,
+            dag_id=run_context.dag_id,
+            task_id=run_context.task_id,
+            input_path=str(amazon_path),
+            status="started",
+        )
         amazon_records = [normalize_amazon(row) for row in load_jsonl(amazon_path)]
         normalized_records.extend(amazon_records)
         source_counts["amazon"] = len(amazon_records)
-        print(f"Loaded {len(amazon_records)} Amazon records from {amazon_path}")
-    else:
-        print("Amazon input not found.")
+        available_sources.append(("amazon", amazon_path))
+        log_event(
+            logger,
+            "source_fetch_completed",
+            source="amazon",
+            stage=run_context.stage,
+            run_id=run_context.run_id,
+            dag_id=run_context.dag_id,
+            task_id=run_context.task_id,
+            input_path=str(amazon_path),
+            record_count=len(amazon_records),
+            duration_ms=round((time.perf_counter() - source_started_at) * 1000, 2),
+            status="success",
+        )
 
     yelp_review_path = find_first_existing_path(settings.data_dir, YELP_REVIEW_FILE_CANDIDATES)
     if yelp_review_path:
+        source_started_at = time.perf_counter()
+        log_event(
+            logger,
+            "source_fetch_started",
+            source="yelp",
+            stage=run_context.stage,
+            run_id=run_context.run_id,
+            dag_id=run_context.dag_id,
+            task_id=run_context.task_id,
+            input_path=str(yelp_review_path),
+            status="started",
+        )
         yelp_business_path = find_first_existing_path(settings.data_dir, YELP_BUSINESS_FILE_CANDIDATES)
         business_lookup = load_yelp_business_lookup(yelp_business_path) if yelp_business_path else {}
         yelp_records = [
@@ -422,36 +580,116 @@ def run_local_normalization(include_optional_sources: bool = True) -> list[dict[
         ]
         normalized_records.extend(yelp_records)
         source_counts["yelp"] = len(yelp_records)
-        print(f"Loaded {len(yelp_records)} Yelp records from {yelp_review_path}")
-    else:
-        print("Yelp input not found.")
+        available_sources.append(("yelp", yelp_review_path))
+        log_event(
+            logger,
+            "source_fetch_completed",
+            source="yelp",
+            stage=run_context.stage,
+            run_id=run_context.run_id,
+            dag_id=run_context.dag_id,
+            task_id=run_context.task_id,
+            input_path=str(yelp_review_path),
+            record_count=len(yelp_records),
+            duration_ms=round((time.perf_counter() - source_started_at) * 1000, 2),
+            status="success",
+        )
 
     ebay_path = find_first_existing_path(settings.data_dir, EBAY_FILE_CANDIDATES)
     if ebay_path:
+        source_started_at = time.perf_counter()
+        log_event(
+            logger,
+            "source_fetch_started",
+            source="ebay",
+            stage=run_context.stage,
+            run_id=run_context.run_id,
+            dag_id=run_context.dag_id,
+            task_id=run_context.task_id,
+            input_path=str(ebay_path),
+            status="started",
+        )
         ebay_records = [normalize_ebay(row) for row in load_jsonl(ebay_path)]
         normalized_records.extend(ebay_records)
         source_counts["ebay"] = len(ebay_records)
-        print(f"Loaded {len(ebay_records)} eBay records from {ebay_path}")
-    else:
-        print("eBay input not found.")
+        available_sources.append(("ebay", ebay_path))
+        log_event(
+            logger,
+            "source_fetch_completed",
+            source="ebay",
+            stage=run_context.stage,
+            run_id=run_context.run_id,
+            dag_id=run_context.dag_id,
+            task_id=run_context.task_id,
+            input_path=str(ebay_path),
+            record_count=len(ebay_records),
+            duration_ms=round((time.perf_counter() - source_started_at) * 1000, 2),
+            status="success",
+        )
 
     ifixit_path = find_first_existing_path(settings.data_dir, IFIXIT_FILE_CANDIDATES)
     if ifixit_path:
+        source_started_at = time.perf_counter()
+        log_event(
+            logger,
+            "source_fetch_started",
+            source="ifixit",
+            stage=run_context.stage,
+            run_id=run_context.run_id,
+            dag_id=run_context.dag_id,
+            task_id=run_context.task_id,
+            input_path=str(ifixit_path),
+            status="started",
+        )
         ifixit_records = [normalize_ifixit(row) for row in load_jsonl(ifixit_path)]
         normalized_records.extend(ifixit_records)
         source_counts["ifixit"] = len(ifixit_records)
-        print(f"Loaded {len(ifixit_records)} iFixit records from {ifixit_path}")
-    else:
-        print("iFixit input not found.")
+        available_sources.append(("ifixit", ifixit_path))
+        log_event(
+            logger,
+            "source_fetch_completed",
+            source="ifixit",
+            stage=run_context.stage,
+            run_id=run_context.run_id,
+            dag_id=run_context.dag_id,
+            task_id=run_context.task_id,
+            input_path=str(ifixit_path),
+            record_count=len(ifixit_records),
+            duration_ms=round((time.perf_counter() - source_started_at) * 1000, 2),
+            status="success",
+        )
 
     youtube_path = find_first_existing_path(settings.data_dir, YOUTUBE_FILE_CANDIDATES)
     if youtube_path:
+        source_started_at = time.perf_counter()
+        log_event(
+            logger,
+            "source_fetch_started",
+            source="youtube",
+            stage=run_context.stage,
+            run_id=run_context.run_id,
+            dag_id=run_context.dag_id,
+            task_id=run_context.task_id,
+            input_path=str(youtube_path),
+            status="started",
+        )
         youtube_records = [normalize_youtube(row) for row in load_jsonl(youtube_path)]
         normalized_records.extend(youtube_records)
         source_counts["youtube"] = len(youtube_records)
-        print(f"Loaded {len(youtube_records)} YouTube records from {youtube_path}")
-    else:
-        print("YouTube input not found.")
+        available_sources.append(("youtube", youtube_path))
+        log_event(
+            logger,
+            "source_fetch_completed",
+            source="youtube",
+            stage=run_context.stage,
+            run_id=run_context.run_id,
+            dag_id=run_context.dag_id,
+            task_id=run_context.task_id,
+            input_path=str(youtube_path),
+            record_count=len(youtube_records),
+            duration_ms=round((time.perf_counter() - source_started_at) * 1000, 2),
+            status="success",
+        )
 
     if include_optional_sources:
         reddit_path = find_first_existing_path(settings.data_dir, REDDIT_FILE_CANDIDATES)
@@ -459,33 +697,118 @@ def run_local_normalization(include_optional_sources: bool = True) -> list[dict[
             reddit_records = [normalize_reddit(row) for row in load_jsonl(reddit_path)]
             normalized_records.extend(reddit_records)
             source_counts["reddit"] = len(reddit_records)
-            print(f"Loaded {len(reddit_records)} Reddit records from {reddit_path}")
+            available_sources.append(("reddit", reddit_path))
 
     if not normalized_records:
-        print("No source files were available for normalization.")
-        return []
+        log_event(
+            logger,
+            "normalization_failed",
+            level=logging.ERROR,
+            stage=run_context.stage,
+            run_id=run_context.run_id,
+            dag_id=run_context.dag_id,
+            task_id=run_context.task_id,
+            status="failed",
+            error_type="MissingInputError",
+            error_message="No real input source files were available for normalization.",
+        )
+        raise RuntimeError("No real input source files were available for normalization.")
+
+    for source_name, source_path in available_sources:
+        _upload_raw_snapshot(storage_manager, logger, run_context, source_name, source_path)
+        raw_sources_for_promotion.append(source_name)
 
     _write_jsonl(settings.normalized_jsonl_path, normalized_records)
-
-    print("\nNormalization report")
-    print(f"Total normalized records: {len(normalized_records)}")
-    for source_name in PROPOSAL_CORE_SOURCES + OPTIONAL_SOURCES:
-        if source_name in source_counts:
-            print(f"  {source_name}: {source_counts[source_name]}")
+    _publish_normalized_output(storage_manager, logger, run_context, settings.normalized_jsonl_path)
 
     rated_values = [
         record["rating_normalized"]
         for record in normalized_records
         if record["rating_normalized"] is not None
     ]
-    print(f"Average normalized rating: {_average(rated_values):.4f}")
-    print(f"Output written to: {settings.normalized_jsonl_path}")
+
+    for source_name in raw_sources_for_promotion:
+        current_prefix = storage_manager.resolver.raw_current_prefix(source_name)
+        run_prefix = storage_manager.resolver.raw_run_prefix(source_name, run_context.run_id)
+        promotion = storage_manager.promote_run_prefix(
+            run_prefix,
+            current_prefix,
+            run_id=run_context.run_id,
+            metadata={"source": source_name, "stage": "raw_source_snapshot", "status": "success"},
+        )
+        log_event(
+            logger,
+            "latest_run_promoted",
+            source=source_name,
+            stage="raw_source_snapshot",
+            run_id=run_context.run_id,
+            dag_id=run_context.dag_id,
+            task_id=run_context.task_id,
+            output_path=current_prefix,
+            file_count=promotion["copied_count"],
+            status="success",
+        )
+
+    log_event(
+        logger,
+        "normalization_completed",
+        stage=run_context.stage,
+        run_id=run_context.run_id,
+        dag_id=run_context.dag_id,
+        task_id=run_context.task_id,
+        record_count=len(normalized_records),
+        output_path=str(settings.normalized_jsonl_path),
+        status="success",
+        average_rating_normalized=round(_average(rated_values), 4),
+    )
 
     return normalized_records
 
 
 def main() -> None:
-    run_local_normalization()
+    settings = get_settings()
+    configure_structured_logging(settings.log_level)
+    logger = get_logger("normalization.local")
+    run_context = build_run_context(stage="normalize_local_preview")
+    started_at = time.perf_counter()
+
+    log_event(
+        logger,
+        "pipeline_run_started",
+        stage=run_context.stage,
+        run_id=run_context.run_id,
+        dag_id=run_context.dag_id,
+        task_id=run_context.task_id,
+        status="started",
+    )
+
+    try:
+        run_local_normalization(run_context=run_context, logger=logger)
+        log_event(
+            logger,
+            "pipeline_run_completed",
+            stage=run_context.stage,
+            run_id=run_context.run_id,
+            dag_id=run_context.dag_id,
+            task_id=run_context.task_id,
+            duration_ms=round((time.perf_counter() - started_at) * 1000, 2),
+            status="success",
+        )
+    except Exception as error:
+        log_event(
+            logger,
+            "pipeline_run_failed",
+            level=logging.ERROR,
+            stage=run_context.stage,
+            run_id=run_context.run_id,
+            dag_id=run_context.dag_id,
+            task_id=run_context.task_id,
+            duration_ms=round((time.perf_counter() - started_at) * 1000, 2),
+            status="failed",
+            error_type=type(error).__name__,
+            error_message=str(error),
+        )
+        raise
 
 
 if __name__ == "__main__":

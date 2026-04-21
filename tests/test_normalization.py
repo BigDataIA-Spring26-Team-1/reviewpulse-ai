@@ -1,4 +1,4 @@
-"""Unit tests for proposal-aligned schema normalization."""
+"""Unit tests for shared schema normalization."""
 
 from __future__ import annotations
 

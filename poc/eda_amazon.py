@@ -59,52 +59,10 @@ def load_amazon_sample():
         print(f"  Done: {len(records):,} reviews loaded.\n")
         return pd.DataFrame(records)
     except Exception as e:
-        print(f"  HuggingFace streaming failed: {e}")
-        print("  Falling back to synthetic sample for demonstration...\n")
-        return generate_synthetic_sample()
-
-
-def generate_synthetic_sample():
-    """
-    Fallback: generate a synthetic sample that mirrors the real schema.
-    This lets us demonstrate the EDA pipeline even without network access.
-    The schema matches the real Amazon Reviews 2023 format exactly.
-    """
-    import random
-    random.seed(42)
-    
-    products = [f"B0{random.randint(10000,99999)}" for _ in range(500)]
-    records = []
-    for i in range(SAMPLE_SIZE):
-        # Rating distribution mimics real Amazon: ~58% are 5-star
-        rating_weights = [0.08, 0.05, 0.09, 0.20, 0.58]
-        rating = float(random.choices([1,2,3,4,5], weights=rating_weights)[0])
-        
-        # 12% of reviews have empty text (rating-only), matching real data
-        has_text = random.random() > 0.12
-        text_len = random.randint(10, 500) if has_text else 0
-        text = "Sample review text. " * (text_len // 20) if has_text else ""
-        
-        # Timestamps span 2010-2023, 80% post-2015
-        if random.random() < 0.80:
-            year = random.randint(2015, 2023)
-        else:
-            year = random.randint(2010, 2014)
-        ts = int(datetime(year, random.randint(1,12), random.randint(1,28)).timestamp() * 1000)
-        
-        records.append({
-            "rating": rating,
-            "title": f"Review title {i}" if random.random() > 0.08 else None,
-            "text": text,
-            "images": [],
-            "asin": random.choice(products),
-            "parent_asin": random.choice(products),
-            "user_id": f"USER_{random.randint(10000,99999)}",
-            "timestamp": ts,
-            "helpful_vote": random.choices([0,0,0,0,1,2,3,5,10], k=1)[0],
-            "verified_purchase": random.random() > 0.15,
-        })
-    return pd.DataFrame(records)
+        raise RuntimeError(
+            "Amazon Reviews 2023 streaming failed. Configure real Hugging Face access "
+            "and rerun instead of using synthetic fallback data."
+        ) from e
 
 
 def profile_schema(df):

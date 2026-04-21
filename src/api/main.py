@@ -11,7 +11,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import chromadb
 from fastapi import FastAPI, Query
@@ -31,6 +31,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.common.settings import get_settings
+from src.insights import (
+    build_dataset_profile,
+    build_normalization_explanations,
+    build_quality_metrics,
+    build_source_comparison,
+)
 
 
 try:
@@ -100,6 +106,29 @@ def get_model() -> SentenceTransformer:
 def get_collection():
     client = chromadb.PersistentClient(path=CHROMA_DIR)
     return client.get_collection(name=CHROMA_COLLECTION_NAME)
+
+
+def get_insights_dataset_path() -> Path | None:
+    if settings.normalized_parquet_path.exists():
+        return settings.normalized_parquet_path
+    if settings.sentiment_parquet_path.exists():
+        return settings.sentiment_parquet_path
+    return None
+
+
+def load_insights_rows() -> tuple[list[dict[str, Any]] | None, Path | None]:
+    dataset_path = get_insights_dataset_path()
+    if dataset_path is None:
+        return None, None
+
+    spark = get_spark()
+    try:
+        df = spark.read.parquet(str(dataset_path))
+        rows = [row.asDict(recursive=True) for row in df.toLocalIterator()]
+    finally:
+        spark.stop()
+
+    return rows, dataset_path
 
 
 def looks_like_machine_id(value: str) -> bool:
@@ -335,6 +364,63 @@ def source_stats():
             for row in sentiment
         ],
     }
+
+
+@app.get("/data/profile")
+def data_profile():
+    rows, dataset_path = load_insights_rows()
+    if rows is None or dataset_path is None:
+        return {
+            "error": (
+                "No normalized dataset found. Run the normalization pipeline first "
+                "to create parquet data for profiling."
+            )
+        }
+
+    return build_dataset_profile(rows, dataset_path=str(dataset_path))
+
+
+@app.get("/data/compare")
+def data_compare():
+    rows, dataset_path = load_insights_rows()
+    if rows is None or dataset_path is None:
+        return {
+            "error": (
+                "No normalized dataset found. Run the normalization pipeline first "
+                "to compare sources."
+            )
+        }
+
+    comparison = build_source_comparison(rows)
+    comparison["dataset_path"] = str(dataset_path)
+    return comparison
+
+
+@app.get("/data/quality")
+def data_quality():
+    rows, dataset_path = load_insights_rows()
+    if rows is None or dataset_path is None:
+        return {
+            "error": (
+                "No normalized dataset found. Run the normalization pipeline first "
+                "to compute data quality metrics."
+            )
+        }
+
+    quality = build_quality_metrics(rows)
+    quality["dataset_path"] = str(dataset_path)
+    return quality
+
+
+@app.get("/data/normalize/explain")
+def data_normalize_explain(
+    source: Optional[str] = Query(
+        None,
+        description="Optional source filter: amazon/yelp/ebay/ifixit/youtube",
+    ),
+    sample_index: int = Query(0, ge=0, le=100),
+):
+    return build_normalization_explanations(source=source, sample_index=sample_index)
 
 
 @app.get("/search/semantic", response_model=list[SearchResponse])
