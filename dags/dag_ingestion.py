@@ -2,18 +2,21 @@
 ReviewPulse AI Airflow DAG for the ingestion and processing pipeline.
 
 This DAG runs the checked-in pipeline stages in order:
-1. Optionally ingest Yelp raw data when YELP_DATASET_PATH or YELP_DATASET_S3_URI is configured.
-2. Validate and normalize raw source data into a shared JSONL preview.
-3. Run the Spark normalization job for the core sources.
-4. Score sentiment.
-5. Build embeddings.
-6. Run tests.
+1. Ingest Amazon raw data from the configured Hugging Face dataset.
+2. Optionally ingest Yelp, eBay, iFixit, and YouTube raw data when their source configs are present.
+3. Validate and normalize raw source data into a shared JSONL preview.
+4. Run the Spark normalization job for the core sources.
+5. Score sentiment.
+6. Build embeddings.
+7. Run tests.
 """
 
 from __future__ import annotations
 
 import importlib
 import logging
+import os
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -30,19 +33,162 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.common.settings import get_settings
 from src.common.structured_logging import configure_structured_logging, get_logger, log_event
 
-DAG_STRUCTURE = """
-DAG: reviewpulse_pipeline
-Schedule: Daily at 2 AM UTC
 
-Task Flow:
-    ingest_yelp (optional; only when Yelp source config is provided)
-        -> normalize_local_preview
-    normalize_local_preview
-        -> normalize_reviews_spark
-        -> score_sentiment
-        -> build_embeddings
-        -> run_tests
-"""
+@dataclass(frozen=True, slots=True)
+class DagTaskSpec:
+    task_id: str
+    bash_command: str
+
+
+def _project_python_invocation() -> str:
+    project_python = os.getenv("REVIEWPULSE_PROJECT_PYTHON", "").strip()
+    if project_python:
+        return project_python
+    return "poetry run python"
+
+
+def _project_module_command(module_name: str) -> str:
+    return f"cd {PROJECT_ROOT_POSIX} && {_project_python_invocation()} -m {module_name}"
+
+
+def _project_pytest_command(test_target: str) -> str:
+    return f"cd {PROJECT_ROOT_POSIX} && {_project_python_invocation()} -m pytest {test_target}"
+
+
+def _has_values(values: tuple[str, ...]) -> bool:
+    return any(str(value).strip() for value in values)
+
+
+def _amazon_ingestion_enabled(settings: Any) -> bool:
+    return bool(str(settings.amazon_dataset_name).strip() and str(settings.amazon_category).strip())
+
+
+def _yelp_ingestion_enabled(settings: Any) -> bool:
+    return bool(settings.has_yelp_dataset_source)
+
+
+def _ebay_ingestion_enabled(settings: Any) -> bool:
+    has_credentials = all(
+        str(value).strip()
+        for value in (settings.ebay_app_id, settings.ebay_dev_id, settings.ebay_cert_id)
+    )
+    has_workload = bool(
+        settings.ebay_crawl_all_categories
+        or _has_values(settings.ebay_category_ids)
+        or _has_values(settings.ebay_search_queries)
+    )
+    return has_credentials and has_workload
+
+
+def _ifixit_ingestion_enabled(settings: Any) -> bool:
+    return bool(_has_values(settings.ifixit_guide_ids) or settings.ifixit_max_guides > 0)
+
+
+def _youtube_ingestion_enabled(settings: Any) -> bool:
+    return bool(
+        str(settings.youtube_api_key).strip()
+        or _has_values(settings.youtube_video_ids)
+        or _has_values(settings.youtube_search_queries)
+    )
+
+
+def _build_source_task_specs(settings: Any) -> tuple[DagTaskSpec, ...]:
+    task_specs: list[DagTaskSpec] = []
+
+    if _amazon_ingestion_enabled(settings):
+        task_specs.append(
+            DagTaskSpec(
+                task_id="ingest_amazon",
+                bash_command=_project_module_command("src.ingestion.amazon"),
+            )
+        )
+    if _yelp_ingestion_enabled(settings):
+        task_specs.append(
+            DagTaskSpec(
+                task_id="ingest_yelp",
+                bash_command=_project_module_command("src.ingestion.yelp"),
+            )
+        )
+    if _ebay_ingestion_enabled(settings):
+        task_specs.append(
+            DagTaskSpec(
+                task_id="ingest_ebay",
+                bash_command=_project_module_command("src.ingestion.ebay"),
+            )
+        )
+    if _ifixit_ingestion_enabled(settings):
+        task_specs.append(
+            DagTaskSpec(
+                task_id="ingest_ifixit",
+                bash_command=_project_module_command("src.ingestion.ifixit"),
+            )
+        )
+    if _youtube_ingestion_enabled(settings):
+        task_specs.append(
+            DagTaskSpec(
+                task_id="ingest_youtube",
+                bash_command=_project_module_command("src.ingestion.youtube"),
+            )
+        )
+
+    return tuple(task_specs)
+
+
+def _build_processing_task_specs() -> tuple[DagTaskSpec, ...]:
+    return (
+        DagTaskSpec(
+            task_id="normalize_local_preview",
+            bash_command=_project_module_command("src.normalization.core"),
+        ),
+        DagTaskSpec(
+            task_id="normalize_reviews_spark",
+            bash_command=_project_module_command("src.spark.normalize_reviews_spark"),
+        ),
+        DagTaskSpec(
+            task_id="score_sentiment",
+            bash_command=_project_module_command("src.ml.sentiment_scoring"),
+        ),
+        DagTaskSpec(
+            task_id="build_embeddings",
+            bash_command=_project_module_command("src.retrieval.build_embeddings"),
+        ),
+        DagTaskSpec(
+            task_id="run_tests",
+            bash_command=_project_pytest_command("tests/test_normalization.py -v"),
+        ),
+    )
+
+
+def _describe_dag_structure(settings: Any) -> str:
+    source_task_specs = _build_source_task_specs(settings)
+
+    lines = [
+        "DAG: reviewpulse_pipeline",
+        "Schedule: Daily at 2 AM UTC",
+        "",
+        "Task Flow:",
+    ]
+    if source_task_specs:
+        lines.append("    Parallel source ingestion:")
+        for spec in source_task_specs:
+            lines.append(f"        {spec.task_id}")
+        lines.append("            -> normalize_local_preview")
+    else:
+        lines.append("    normalize_local_preview")
+
+    lines.extend(
+        [
+            "    normalize_local_preview",
+            "        -> normalize_reviews_spark",
+            "        -> score_sentiment",
+            "        -> build_embeddings",
+            "        -> run_tests",
+        ]
+    )
+    return "\n".join(lines)
+
+
+DAG_STRUCTURE = _describe_dag_structure(get_settings())
 
 
 def _load_airflow_objects() -> tuple[Any, Any]:
@@ -98,6 +244,8 @@ def _log_airflow_task_failed(context: dict[str, Any]) -> None:
 def _build_dag() -> Any:
     DAG, BashOperator = _load_airflow_objects()
     project_settings = get_settings()
+    source_task_specs = _build_source_task_specs(project_settings)
+    processing_task_specs = _build_processing_task_specs()
 
     default_args = {
         "owner": "reviewpulse",
@@ -121,67 +269,39 @@ def _build_dag() -> Any:
             "REVIEWPULSE_DAG_ID": "{{ dag.dag_id }}",
             "REVIEWPULSE_TASK_ID": "{{ task.task_id }}",
         }
-
-        ingest_yelp = None
-        if project_settings.has_yelp_dataset_source:
-            ingest_yelp = BashOperator(
-                task_id="ingest_yelp",
-                bash_command=f"cd {PROJECT_ROOT_POSIX} && python -m src.ingestion.yelp",
+        source_tasks: dict[str, Any] = {}
+        for spec in source_task_specs:
+            source_tasks[spec.task_id] = BashOperator(
+                task_id=spec.task_id,
+                bash_command=spec.bash_command,
                 env=task_env,
                 on_execute_callback=_log_airflow_task_started,
                 on_success_callback=_log_airflow_task_completed,
                 on_failure_callback=_log_airflow_task_failed,
             )
 
-        normalize_local_preview = BashOperator(
-            task_id="normalize_local_preview",
-            bash_command=f"cd {PROJECT_ROOT_POSIX} && python -m src.normalization.core",
-            env=task_env,
-            on_execute_callback=_log_airflow_task_started,
-            on_success_callback=_log_airflow_task_completed,
-            on_failure_callback=_log_airflow_task_failed,
+        processing_tasks: dict[str, Any] = {}
+        for spec in processing_task_specs:
+            processing_tasks[spec.task_id] = BashOperator(
+                task_id=spec.task_id,
+                bash_command=spec.bash_command,
+                env=task_env,
+                on_execute_callback=_log_airflow_task_started,
+                on_success_callback=_log_airflow_task_completed,
+                on_failure_callback=_log_airflow_task_failed,
+            )
+
+        normalize_local_preview = processing_tasks["normalize_local_preview"]
+        for task in source_tasks.values():
+            task >> normalize_local_preview
+
+        (
+            processing_tasks["normalize_local_preview"]
+            >> processing_tasks["normalize_reviews_spark"]
+            >> processing_tasks["score_sentiment"]
+            >> processing_tasks["build_embeddings"]
+            >> processing_tasks["run_tests"]
         )
-
-        normalize_spark = BashOperator(
-            task_id="normalize_reviews_spark",
-            bash_command=f"cd {PROJECT_ROOT_POSIX} && python -m src.spark.normalize_reviews_spark",
-            env=task_env,
-            on_execute_callback=_log_airflow_task_started,
-            on_success_callback=_log_airflow_task_completed,
-            on_failure_callback=_log_airflow_task_failed,
-        )
-
-        score_sentiment = BashOperator(
-            task_id="score_sentiment",
-            bash_command=f"cd {PROJECT_ROOT_POSIX} && python -m src.ml.sentiment_scoring",
-            env=task_env,
-            on_execute_callback=_log_airflow_task_started,
-            on_success_callback=_log_airflow_task_completed,
-            on_failure_callback=_log_airflow_task_failed,
-        )
-
-        build_embeddings = BashOperator(
-            task_id="build_embeddings",
-            bash_command=f"cd {PROJECT_ROOT_POSIX} && python -m src.retrieval.build_embeddings",
-            env=task_env,
-            on_execute_callback=_log_airflow_task_started,
-            on_success_callback=_log_airflow_task_completed,
-            on_failure_callback=_log_airflow_task_failed,
-        )
-
-        run_tests = BashOperator(
-            task_id="run_tests",
-            bash_command=f"cd {PROJECT_ROOT_POSIX} && pytest tests/test_normalization.py -v",
-            env=task_env,
-            on_execute_callback=_log_airflow_task_started,
-            on_success_callback=_log_airflow_task_completed,
-            on_failure_callback=_log_airflow_task_failed,
-        )
-
-        if ingest_yelp is not None:
-            ingest_yelp >> normalize_local_preview
-
-        normalize_local_preview >> normalize_spark >> score_sentiment >> build_embeddings >> run_tests
 
     return airflow_dag
 
