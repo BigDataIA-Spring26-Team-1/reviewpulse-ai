@@ -100,6 +100,8 @@ class Settings:
     ifixit_max_guides: int
     youtube_api_key: str
     youtube_video_ids: tuple[str, ...]
+    youtube_search_queries: tuple[str, ...]
+    youtube_max_videos_per_query: int
     youtube_transcript_languages: tuple[str, ...]
 
     @property
@@ -192,5 +194,7 @@ def get_settings() -> Settings:
         ifixit_max_guides=_int_env("IFIXIT_MAX_GUIDES", 0),
         youtube_api_key=os.getenv("YOUTUBE_API_KEY", "").strip(),
         youtube_video_ids=_csv_env("YOUTUBE_VIDEO_IDS"),
+        youtube_search_queries=_csv_env("YOUTUBE_SEARCH_QUERIES"),
+        youtube_max_videos_per_query=_int_env("YOUTUBE_MAX_VIDEOS_PER_QUERY", 5),
         youtube_transcript_languages=_csv_env("YOUTUBE_TRANSCRIPT_LANGUAGES") or ("en",),
     )

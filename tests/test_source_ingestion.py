@@ -25,7 +25,15 @@ from src.ingestion.ebay import (
     run as run_ebay,
 )
 from src.ingestion.ifixit import map_guide_payload, resolve_guide_ids, run as run_ifixit
-from src.ingestion.youtube import build_record, resolve_video_ids
+from src.ingestion.youtube import (
+    BROAD_REVIEW_SEARCH_QUERIES,
+    build_discovery_queries,
+    build_record,
+    discover_video_ids,
+    fetch_api_search_video_ids,
+    resolve_video_ids,
+    run as run_youtube,
+)
 from src.ingestion.yelp import (
     BUSINESS_FILENAME,
     REVIEW_FILENAME,
@@ -85,6 +93,8 @@ def build_test_settings(workspace: Path) -> Settings:
         ifixit_max_guides=0,
         youtube_api_key="",
         youtube_video_ids=("https://youtu.be/abcdefghijk",),
+        youtube_search_queries=tuple(),
+        youtube_max_videos_per_query=5,
         youtube_transcript_languages=("en",),
     )
 
@@ -1180,6 +1190,287 @@ def test_run_ifixit_skips_failed_guides_and_keeps_successes():
 
 def test_resolve_video_ids_accepts_urls_and_ids():
     assert resolve_video_ids(["https://youtu.be/abcdefghijk", "abcdefghijk"]) == ("abcdefghijk",)
+
+
+def test_discover_video_ids_uses_search_queries_when_ids_empty():
+    workspace = make_workspace("discover_youtube_search")
+    try:
+        settings = replace(
+            build_test_settings(workspace),
+            youtube_video_ids=tuple(),
+            youtube_search_queries=("sony headphones review", "nothing phone review"),
+            youtube_max_videos_per_query=2,
+        )
+
+        class FakeResponse:
+            def __init__(self, text: str) -> None:
+                self.text = text
+
+            def raise_for_status(self) -> None:
+                return None
+
+        class FakeSession:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            def get(self, url: str, *, params: dict[str, object], timeout: int) -> FakeResponse:
+                self.calls.append({"url": url, "params": params, "timeout": timeout})
+                query = params["search_query"]
+                if query == "sony headphones review":
+                    return FakeResponse("watch?v=AAAAAAAAAAA watch?v=AAAAAAAAAAA watch?v=BBBBBBBBBBB")
+                if query == "nothing phone review":
+                    return FakeResponse("watch?v=BBBBBBBBBBB watch?v=CCCCCCCCCCC")
+                raise AssertionError(f"Unexpected query: {query}")
+
+        session = FakeSession()
+        video_ids = discover_video_ids(settings, session=session)
+
+        assert video_ids == ("AAAAAAAAAAA", "BBBBBBBBBBB", "CCCCCCCCCCC")
+        assert len(session.calls) == 2
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
+def test_build_discovery_queries_uses_broad_api_seed_queries_only():
+    workspace = make_workspace("discover_youtube_broad_queries")
+    try:
+        settings = replace(
+            build_test_settings(workspace),
+            youtube_api_key="api-key",
+            youtube_search_queries=("custom query",),
+        )
+
+        queries = build_discovery_queries(settings)
+
+        assert queries == BROAD_REVIEW_SEARCH_QUERIES
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
+def test_fetch_api_search_video_ids_reads_video_ids_from_youtube_api():
+    class FakeResponse:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self._payload = payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def get(self, url: str, *, params: dict[str, object], timeout: int):
+            self.calls.append({"url": url, "params": params, "timeout": timeout})
+            return FakeResponse(
+                {
+                    "items": [
+                        {"id": {"videoId": "AAAAAAAAAAA"}},
+                        {"id": {"videoId": "AAAAAAAAAAA"}},
+                        {"id": {"videoId": "BBBBBBBBBBB"}},
+                    ]
+                }
+            )
+
+    session = FakeSession()
+    video_ids = fetch_api_search_video_ids(
+        "smartphone review",
+        api_key="api-key",
+        max_results=2,
+        session=session,
+        published_after="2024-01-01T00:00:00Z",
+    )
+
+    assert video_ids == ("AAAAAAAAAAA", "BBBBBBBBBBB")
+    assert session.calls == [
+        {
+            "url": "https://www.googleapis.com/youtube/v3/search",
+            "params": {
+                "part": "snippet",
+                "type": "video",
+                "q": "smartphone review",
+                "maxResults": 2,
+                "key": "api-key",
+                "order": "relevance",
+                "videoEmbeddable": "true",
+                "videoSyndicated": "true",
+                "videoDuration": "long",
+                "relevanceLanguage": "en",
+                "regionCode": "US",
+                "publishedAfter": "2024-01-01T00:00:00Z",
+            },
+            "timeout": 30,
+        }
+    ]
+
+
+def test_discover_video_ids_uses_api_discovery_when_key_present(monkeypatch: pytest.MonkeyPatch):
+    workspace = make_workspace("discover_youtube_api_search")
+    try:
+        settings = replace(
+            build_test_settings(workspace),
+            youtube_api_key="api-key",
+            youtube_video_ids=tuple(),
+            youtube_search_queries=("custom query",),
+            youtube_max_videos_per_query=2,
+        )
+
+        calls: list[str] = []
+
+        def fake_fetch_api_search_video_ids(
+            query: str,
+            *,
+            api_key: str,
+            max_results: int,
+            session=None,
+            published_after: str | None = None,
+        ) -> tuple[str, ...]:
+            calls.append(query)
+            if query == BROAD_REVIEW_SEARCH_QUERIES[0]:
+                return ("AAAAAAAAAAA", "BBBBBBBBBBB")
+            if query == "custom query":
+                return ("BBBBBBBBBBB", "CCCCCCCCCCC")
+            return tuple()
+
+        monkeypatch.setattr(
+            "src.ingestion.youtube.fetch_api_search_video_ids",
+            fake_fetch_api_search_video_ids,
+        )
+
+        video_ids = discover_video_ids(settings, session=object())
+
+        assert video_ids[:2] == ("AAAAAAAAAAA", "BBBBBBBBBBB")
+        assert calls[0] == BROAD_REVIEW_SEARCH_QUERIES[0]
+        assert "custom query" not in calls
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
+def test_run_youtube_search_query_mode_writes_and_promotes(monkeypatch: pytest.MonkeyPatch):
+    workspace = make_workspace("run_youtube_search_mode")
+    try:
+        settings = replace(
+            build_test_settings(workspace),
+            youtube_video_ids=tuple(),
+            youtube_search_queries=("sony headphones review",),
+            youtube_max_videos_per_query=2,
+        )
+        storage_manager = build_storage_manager()
+
+        monkeypatch.setattr(
+            "src.ingestion.youtube.fetch_transcript_segments",
+            lambda video_id, languages: [
+                {"text": f"Transcript for {video_id}", "duration": 5.0},
+            ],
+        )
+
+        class FakeResponse:
+            def __init__(self, *, text: str = "", payload: dict[str, object] | None = None) -> None:
+                self.text = text
+                self._payload = payload or {}
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict[str, object]:
+                return self._payload
+
+        class FakeSession:
+            def get(
+                self,
+                url: str,
+                *,
+                params: dict[str, object],
+                timeout: int,
+            ):
+                if url.endswith("/results"):
+                    return FakeResponse(text="watch?v=AAAAAAAAAAA watch?v=BBBBBBBBBBB")
+                if url.endswith("/oembed"):
+                    video_url = str(params["url"])
+                    video_id = video_url.split("v=")[-1]
+                    return FakeResponse(payload={"title": f"Title {video_id}", "author_name": "Tech Reviewer"})
+                raise AssertionError(f"Unexpected URL: {url}")
+
+        result = run_youtube(
+            settings=settings,
+            run_context=build_run_context(stage="ingest_youtube", source="youtube", run_id="run_test"),
+            logger=build_logger(),
+            storage_manager=storage_manager,
+            session=FakeSession(),
+        )
+
+        output_path = workspace / "data" / "youtube" / "youtube_reviews.jsonl"
+        assert output_path.exists()
+        assert count_lines(output_path) == 2
+        assert result.record_count == 2
+        assert (
+            "reviewpulse-bucket",
+            "raw/youtube/current/youtube_reviews.jsonl",
+        ) in storage_manager.client.objects
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
+def test_run_youtube_skips_failed_video_and_keeps_successes(monkeypatch: pytest.MonkeyPatch):
+    workspace = make_workspace("run_youtube_skip_failure")
+    try:
+        settings = replace(
+            build_test_settings(workspace),
+            youtube_video_ids=("AAAAAAAAAAA", "BBBBBBBBBBB"),
+            youtube_search_queries=tuple(),
+        )
+        storage_manager = build_storage_manager()
+
+        def fake_fetch_transcript_segments(video_id: str, languages: tuple[str, ...]):
+            if video_id == "AAAAAAAAAAA":
+                raise RuntimeError("Transcript unavailable")
+            return [{"text": f"Transcript for {video_id}", "duration": 5.0}]
+
+        monkeypatch.setattr(
+            "src.ingestion.youtube.fetch_transcript_segments",
+            fake_fetch_transcript_segments,
+        )
+
+        class FakeResponse:
+            def __init__(self, payload: dict[str, object]) -> None:
+                self._payload = payload
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict[str, object]:
+                return self._payload
+
+        class FakeSession:
+            def get(
+                self,
+                url: str,
+                *,
+                params: dict[str, object],
+                timeout: int,
+            ):
+                if url.endswith("/oembed"):
+                    video_url = str(params["url"])
+                    video_id = video_url.split("v=")[-1]
+                    return FakeResponse({"title": f"Title {video_id}", "author_name": "Tech Reviewer"})
+                raise AssertionError(f"Unexpected URL: {url}")
+
+        result = run_youtube(
+            settings=settings,
+            run_context=build_run_context(stage="ingest_youtube", source="youtube", run_id="run_test"),
+            logger=build_logger(),
+            storage_manager=storage_manager,
+            session=FakeSession(),
+        )
+
+        output_path = workspace / "data" / "youtube" / "youtube_reviews.jsonl"
+        assert output_path.exists()
+        assert count_lines(output_path) == 1
+        assert result.record_count == 1
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
 
 
 def test_build_record_uses_real_transcript_segments():

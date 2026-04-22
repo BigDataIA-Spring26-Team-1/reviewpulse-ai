@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+from datetime import UTC, datetime, timedelta
 from typing import Any, Iterable
  
 import requests
@@ -20,6 +21,36 @@ VIDEO_ID_PATTERNS = (
     r"v=([A-Za-z0-9_-]{11})",
     r"youtu\.be/([A-Za-z0-9_-]{11})",
     r"^([A-Za-z0-9_-]{11})$",
+)
+
+SEARCH_RESULT_ID_PATTERN = re.compile(r"watch\?v=([A-Za-z0-9_-]{11})")
+
+BROAD_REVIEW_SEARCH_QUERIES = (
+    "smartphone review",
+    "budget phone review",
+    "flagship phone review",
+    "laptop review",
+    "gaming laptop review",
+    "tablet review",
+    "smartwatch review",
+    "fitness tracker review",
+    "wireless earbuds review",
+    "noise cancelling headphones review",
+    "bluetooth speaker review",
+    "soundbar review",
+    "TV review",
+    "monitor review",
+    "mechanical keyboard review",
+    "gaming mouse review",
+    "webcam review",
+    "mirrorless camera review",
+    "action camera review",
+    "drone review",
+    "robot vacuum review",
+    "gaming handheld review",
+    "gaming console review",
+    "smart home device review",
+    "streaming device review",
 )
  
  
@@ -43,6 +74,164 @@ def resolve_video_ids(values: Iterable[str]) -> tuple[str, ...]:
     if not normalized:
         raise RuntimeError("YOUTUBE_VIDEO_IDS must include at least one valid video ID or URL.")
     return tuple(normalized)
+
+
+def fetch_search_video_ids(
+    query: str,
+    *,
+    max_results: int,
+    session: requests.Session | None = None,
+) -> tuple[str, ...]:
+    active_session = session or requests.Session()
+    response = active_session.get(
+        "https://www.youtube.com/results",
+        params={
+            "search_query": query,
+            "hl": "en",
+            "persist_hl": 1,
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+
+    discovered: list[str] = []
+    seen: set[str] = set()
+    for candidate in SEARCH_RESULT_ID_PATTERN.findall(response.text):
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        discovered.append(candidate)
+        if len(discovered) >= max_results:
+            break
+
+    return tuple(discovered)
+
+
+def build_discovery_queries(settings: Settings) -> tuple[str, ...]:
+    if settings.youtube_api_key:
+        return BROAD_REVIEW_SEARCH_QUERIES
+
+    discovered: list[str] = []
+    seen: set[str] = set()
+    for query in settings.youtube_search_queries:
+        normalized_query = str(query).strip()
+        if normalized_query and normalized_query not in seen:
+            seen.add(normalized_query)
+            discovered.append(normalized_query)
+
+    return tuple(discovered)
+
+
+def fetch_api_search_video_ids(
+    query: str,
+    *,
+    api_key: str,
+    max_results: int,
+    session: requests.Session | None = None,
+    published_after: str | None = None,
+) -> tuple[str, ...]:
+    active_session = session or requests.Session()
+    discovered: list[str] = []
+    seen: set[str] = set()
+    next_page_token: str | None = None
+    remaining = max_results
+
+    while remaining > 0:
+        page_size = min(50, remaining)
+        params: dict[str, Any] = {
+            "part": "snippet",
+            "type": "video",
+            "q": query,
+            "maxResults": page_size,
+            "key": api_key,
+            "order": "relevance",
+            "videoEmbeddable": "true",
+            "videoSyndicated": "true",
+            "videoDuration": "long",
+            "relevanceLanguage": "en",
+            "regionCode": "US",
+        }
+        if published_after:
+            params["publishedAfter"] = published_after
+        if next_page_token:
+            params["pageToken"] = next_page_token
+
+        response = active_session.get(
+            "https://www.googleapis.com/youtube/v3/search",
+            params=params,
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json()
+
+        items = payload.get("items") or []
+        page_added = 0
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            identifier = item.get("id") or {}
+            video_id = identifier.get("videoId")
+            if not video_id or video_id in seen:
+                continue
+            seen.add(video_id)
+            discovered.append(video_id)
+            page_added += 1
+            remaining -= 1
+            if remaining <= 0:
+                break
+
+        next_page_token = payload.get("nextPageToken")
+        if remaining <= 0 or not next_page_token or page_added == 0:
+            break
+
+    return tuple(discovered)
+
+
+def discover_video_ids(
+    settings: Settings,
+    *,
+    session: requests.Session | None = None,
+) -> tuple[str, ...]:
+    discovered: list[str] = []
+    seen: set[str] = set()
+
+    for video_id in settings.youtube_video_ids:
+        normalized_id = normalize_video_id(video_id)
+        if normalized_id in seen:
+            continue
+        seen.add(normalized_id)
+        discovered.append(normalized_id)
+
+    discovery_queries = build_discovery_queries(settings)
+    if discovery_queries:
+        max_results = max(1, settings.youtube_max_videos_per_query)
+        published_after = None
+        if settings.youtube_api_key:
+            published_after = (datetime.now(UTC) - timedelta(days=365 * 5)).isoformat().replace("+00:00", "Z")
+
+        for query in discovery_queries:
+            if settings.youtube_api_key:
+                search_ids = fetch_api_search_video_ids(
+                    query,
+                    api_key=settings.youtube_api_key,
+                    max_results=max_results,
+                    session=session,
+                    published_after=published_after,
+                )
+            else:
+                search_ids = fetch_search_video_ids(query, max_results=max_results, session=session)
+
+            for video_id in search_ids:
+                if video_id in seen:
+                    continue
+                seen.add(video_id)
+                discovered.append(video_id)
+
+    if not discovered:
+        raise RuntimeError(
+            "Configure YOUTUBE_VIDEO_IDS, YOUTUBE_API_KEY, or YOUTUBE_SEARCH_QUERIES for YouTube ingestion."
+        )
+    return tuple(discovered)
  
  
 def fetch_transcript_segments(video_id: str, languages: tuple[str, ...]) -> list[dict[str, Any]]:
@@ -157,7 +346,8 @@ def run(
     log_event(logger, "pipeline_run_started", **run_context.as_log_fields(), status="started")
  
     try:
-        video_ids = resolve_video_ids(settings.youtube_video_ids)
+        active_session = session or requests.Session()
+        video_ids = discover_video_ids(settings, session=active_session)
         log_event(
             logger,
             "source_fetch_started",
@@ -165,26 +355,45 @@ def run(
             record_count=len(video_ids),
             status="started",
         )
-        active_session = session or requests.Session()
+        log_event(
+            logger,
+            "video_discovery_completed",
+            **run_context.as_log_fields(),
+            record_count=len(video_ids),
+            status="success",
+        )
         records: list[dict[str, Any]] = []
- 
+
         for video_id in video_ids:
             video_started_at = time.perf_counter()
-            segments = fetch_transcript_segments(video_id, settings.youtube_transcript_languages)
-            metadata = fetch_oembed_metadata(video_id, active_session)
-            if settings.youtube_api_key:
-                metadata.update(fetch_api_metadata(video_id, settings.youtube_api_key, active_session))
-            records.append(build_record(video_id=video_id, segments=segments, metadata=metadata))
-            log_event(
-                logger,
-                "source_fetch_completed",
-                **run_context.as_log_fields(),
-                input_path=video_id,
-                record_count=1,
-                duration_ms=round((time.perf_counter() - video_started_at) * 1000, 2),
-                status="success",
-            )
- 
+            try:
+                segments = fetch_transcript_segments(video_id, settings.youtube_transcript_languages)
+                metadata = fetch_oembed_metadata(video_id, active_session)
+                if settings.youtube_api_key:
+                    metadata.update(fetch_api_metadata(video_id, settings.youtube_api_key, active_session))
+                records.append(build_record(video_id=video_id, segments=segments, metadata=metadata))
+                log_event(
+                    logger,
+                    "source_fetch_completed",
+                    **run_context.as_log_fields(),
+                    input_path=video_id,
+                    record_count=1,
+                    duration_ms=round((time.perf_counter() - video_started_at) * 1000, 2),
+                    status="success",
+                )
+            except Exception as error:
+                log_event(
+                    logger,
+                    "source_fetch_failed",
+                    level=logging.ERROR,
+                    **run_context.as_log_fields(),
+                    input_path=video_id,
+                    duration_ms=round((time.perf_counter() - video_started_at) * 1000, 2),
+                    status="failed",
+                    error_type=type(error).__name__,
+                    error_message=str(error),
+                )
+
         if not records:
             raise RuntimeError("YouTube ingestion returned zero transcript records.")
  
