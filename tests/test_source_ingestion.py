@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import requests
 import shutil
 from dataclasses import replace
 from io import StringIO
@@ -15,7 +16,14 @@ from src.common.storage import S3PathResolver, S3StorageManager
 from src.common.structured_logging import configure_structured_logging
 from src.ingestion.amazon import build_dataset_config, run as run_amazon, stream_amazon_records
 from src.ingestion.common import count_lines
-from src.ingestion.ebay import map_item_summary, run as run_ebay
+from src.ingestion.ebay import (
+    discover_leaf_categories,
+    fetch_category_items,
+    fetch_query_items,
+    map_item_summary,
+    resolve_ebay_api_urls,
+    run as run_ebay,
+)
 from src.ingestion.ifixit import map_guide_payload
 from src.ingestion.youtube import build_record, resolve_video_ids
 from src.ingestion.yelp import (
@@ -66,8 +74,11 @@ def build_test_settings(workspace: Path) -> Settings:
         ebay_dev_id="dev-id",
         ebay_cert_id="cert-id",
         ebay_site_id="0",
+        ebay_environment="production",
         ebay_marketplace_id="EBAY_US",
         ebay_search_queries=("sony headphones",),
+        ebay_category_ids=tuple(),
+        ebay_crawl_all_categories=False,
         ebay_max_items_per_query=2,
         ifixit_base_url="https://www.ifixit.com",
         ifixit_guide_ids=("12345",),
@@ -555,18 +566,399 @@ def test_map_item_summary_keeps_real_ebay_fields():
     assert record["feedback_text"] == "Wireless noise-canceling headphones."
 
 
-def test_run_ebay_requires_queries():
+def test_fetch_query_items_reads_all_pages_when_max_items_is_zero():
+    workspace = make_workspace("fetch_ebay_all_pages")
+    try:
+        settings = replace(build_test_settings(workspace), ebay_max_items_per_query=0)
+        requests_seen: list[dict[str, object]] = []
+
+        class FakeResponse:
+            def __init__(self, payload: dict[str, object]) -> None:
+                self._payload = payload
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict[str, object]:
+                return self._payload
+
+        class FakeSession:
+            def __init__(self) -> None:
+                self._responses = iter(
+                    [
+                        {
+                            "itemSummaries": [
+                                {"itemId": "1", "title": "Item 1"},
+                                {"itemId": "2", "title": "Item 2"},
+                            ],
+                            "next": "/buy/browse/v1/item_summary/search?offset=200",
+                        },
+                        {
+                            "itemSummaries": [
+                                {"itemId": "3", "title": "Item 3"},
+                            ],
+                        },
+                    ]
+                )
+
+            def get(self, _url: str, *, headers: dict[str, str], params: dict[str, object], timeout: int) -> FakeResponse:
+                requests_seen.append({"headers": headers, "params": params, "timeout": timeout})
+                return FakeResponse(next(self._responses))
+
+        records = fetch_query_items(
+            "sony headphones",
+            access_token="token",
+            settings=settings,
+            session=FakeSession(),
+        )
+
+        assert [record["item_id"] for record in records] == ["1", "2", "3"]
+        assert requests_seen[0]["params"] == {
+            "q": "sony headphones",
+            "filter": "buyingOptions:{FIXED_PRICE|AUCTION|BEST_OFFER|CLASSIFIED_AD}",
+            "limit": 200,
+            "offset": 0,
+        }
+        assert requests_seen[1]["params"] == {
+            "q": "sony headphones",
+            "filter": "buyingOptions:{FIXED_PRICE|AUCTION|BEST_OFFER|CLASSIFIED_AD}",
+            "limit": 200,
+            "offset": 200,
+        }
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
+def test_discover_leaf_categories_flattens_subtree_leaves():
+    workspace = make_workspace("discover_ebay_leaf_categories")
+    try:
+        settings = replace(build_test_settings(workspace), ebay_category_ids=("550",))
+
+        class FakeResponse:
+            def __init__(self, payload: dict[str, object]) -> None:
+                self._payload = payload
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict[str, object]:
+                return self._payload
+
+        class FakeSession:
+            def get(self, url: str, *, headers: dict[str, str], params: dict[str, object] | None = None, timeout: int):
+                if url.endswith("/get_default_category_tree_id"):
+                    return FakeResponse({"categoryTreeId": "0"})
+                return FakeResponse(
+                    {
+                        "categorySubtreeNode": {
+                            "category": {"categoryId": "550", "categoryName": "Art"},
+                            "childCategoryTreeNodes": [
+                                {
+                                    "category": {"categoryId": "551", "categoryName": "Paintings"},
+                                    "leafCategoryTreeNode": True,
+                                },
+                                {
+                                    "category": {"categoryId": "552", "categoryName": "Prints"},
+                                    "childCategoryTreeNodes": [
+                                        {
+                                            "category": {"categoryId": "553", "categoryName": "Posters"},
+                                            "leafCategoryTreeNode": True,
+                                        }
+                                    ],
+                                },
+                            ],
+                        }
+                    }
+                )
+
+        categories = discover_leaf_categories(
+            access_token="token",
+            settings=settings,
+            session=FakeSession(),
+        )
+
+        assert categories == (
+            {"category_id": "551", "category_name": "Paintings", "category_path": "Art > Paintings"},
+            {"category_id": "553", "category_name": "Posters", "category_path": "Art > Prints > Posters"},
+        )
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
+def test_fetch_category_items_reads_all_pages_when_max_items_is_zero():
+    workspace = make_workspace("fetch_ebay_category_all_pages")
+    try:
+        settings = replace(build_test_settings(workspace), ebay_max_items_per_query=0)
+        requests_seen: list[dict[str, object]] = []
+
+        class FakeResponse:
+            def __init__(self, payload: dict[str, object]) -> None:
+                self._payload = payload
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict[str, object]:
+                return self._payload
+
+        class FakeSession:
+            def __init__(self) -> None:
+                self._responses = iter(
+                    [
+                        {
+                            "itemSummaries": [
+                                {"itemId": "1", "title": "Item 1"},
+                                {"itemId": "2", "title": "Item 2"},
+                            ],
+                            "next": "/buy/browse/v1/item_summary/search?offset=200",
+                        },
+                        {
+                            "itemSummaries": [
+                                {"itemId": "3", "title": "Item 3"},
+                            ],
+                        },
+                    ]
+                )
+
+            def get(self, _url: str, *, headers: dict[str, str], params: dict[str, object], timeout: int) -> FakeResponse:
+                requests_seen.append({"headers": headers, "params": params, "timeout": timeout})
+                return FakeResponse(next(self._responses))
+
+        records = fetch_category_items(
+            {"category_id": "553", "category_name": "Posters", "category_path": "Art > Prints > Posters"},
+            access_token="token",
+            settings=settings,
+            session=FakeSession(),
+        )
+
+        assert [record["item_id"] for record in records] == ["1", "2", "3"]
+        assert requests_seen[0]["params"] == {
+            "category_ids": "553",
+            "filter": "buyingOptions:{FIXED_PRICE|AUCTION|BEST_OFFER|CLASSIFIED_AD}",
+            "limit": 200,
+            "offset": 0,
+        }
+        assert requests_seen[1]["params"] == {
+            "category_ids": "553",
+            "filter": "buyingOptions:{FIXED_PRICE|AUCTION|BEST_OFFER|CLASSIFIED_AD}",
+            "limit": 200,
+            "offset": 200,
+        }
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
+def test_fetch_category_items_retries_transient_server_error():
+    workspace = make_workspace("fetch_ebay_category_retry")
+    try:
+        settings = replace(build_test_settings(workspace), ebay_max_items_per_query=1)
+        requests_seen: list[dict[str, object]] = []
+
+        class FakeResponse:
+            def __init__(self, payload: dict[str, object], status_code: int = 200) -> None:
+                self._payload = payload
+                self.status_code = status_code
+
+            def raise_for_status(self) -> None:
+                if self.status_code >= 400:
+                    error = requests.HTTPError(f"{self.status_code} error")
+                    error.response = self
+                    raise error
+
+            def json(self) -> dict[str, object]:
+                return self._payload
+
+        class FakeSession:
+            def __init__(self) -> None:
+                self._responses = iter(
+                    [
+                        FakeResponse({}, status_code=500),
+                        FakeResponse({"itemSummaries": [{"itemId": "1", "title": "Item 1"}]}),
+                    ]
+                )
+
+            def get(self, _url: str, *, headers: dict[str, str], params: dict[str, object], timeout: int) -> FakeResponse:
+                requests_seen.append({"headers": headers, "params": params, "timeout": timeout})
+                return next(self._responses)
+
+        records = fetch_category_items(
+            {"category_id": "553", "category_name": "Posters", "category_path": "Art > Prints > Posters"},
+            access_token="token",
+            settings=settings,
+            session=FakeSession(),
+        )
+
+        assert [record["item_id"] for record in records] == ["1"]
+        assert len(requests_seen) == 2
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
+def test_resolve_ebay_api_urls_uses_sandbox_for_sandbox_settings():
+    settings = replace(
+        build_test_settings(Path(__file__).resolve().parent),
+        ebay_environment="sandbox",
+    )
+
+    token_url, search_url = resolve_ebay_api_urls(settings)
+
+    assert token_url == "https://api.sandbox.ebay.com/identity/v1/oauth2/token"
+    assert search_url == "https://api.sandbox.ebay.com/buy/browse/v1/item_summary/search"
+
+
+def test_run_ebay_requires_query_or_category_configuration():
     workspace = make_workspace("run_ebay")
     try:
-        settings = replace(build_test_settings(workspace), ebay_search_queries=tuple())
+        settings = replace(
+            build_test_settings(workspace),
+            ebay_search_queries=tuple(),
+            ebay_category_ids=tuple(),
+            ebay_crawl_all_categories=False,
+        )
 
-        with pytest.raises(RuntimeError, match="EBAY_SEARCH_QUERIES"):
+        with pytest.raises(RuntimeError, match="EBAY_SEARCH_QUERIES, EBAY_CATEGORY_IDS, or EBAY_CRAWL_ALL_CATEGORIES"):
             run_ebay(
                 settings=settings,
                 run_context=build_run_context(stage="ingest_ebay", source="ebay", run_id="run_test"),
                 logger=build_logger(),
                 storage_manager=build_storage_manager(),
             )
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
+def test_run_ebay_category_crawl_writes_and_promotes(monkeypatch: pytest.MonkeyPatch):
+    workspace = make_workspace("run_ebay_category_crawl")
+    try:
+        settings = replace(
+            build_test_settings(workspace),
+            ebay_search_queries=tuple(),
+            ebay_category_ids=("550",),
+            ebay_max_items_per_query=0,
+        )
+        storage_manager = build_storage_manager()
+
+        monkeypatch.setattr(
+            "src.ingestion.ebay.get_access_token",
+            lambda _settings, _session=None: "token",
+        )
+        monkeypatch.setattr(
+            "src.ingestion.ebay.discover_leaf_categories",
+            lambda **_kwargs: (
+                {"category_id": "551", "category_name": "Paintings", "category_path": "Art > Paintings"},
+                {"category_id": "553", "category_name": "Posters", "category_path": "Art > Prints > Posters"},
+            ),
+        )
+        monkeypatch.setattr(
+            "src.ingestion.ebay.fetch_category_items",
+            lambda category, **_kwargs: [
+                {
+                    "item_id": f"{category['category_id']}-1",
+                    "title": f"{category['category_name']} Item",
+                    "item_title": f"{category['category_name']} Item",
+                    "seller_rating": "99.0",
+                    "feedback_count": 10,
+                    "feedback_text": "Description",
+                    "category": category["category_name"],
+                    "primary_category": category["category_name"],
+                    "listing_date": "2026-04-22T00:00:00Z",
+                    "seller_id": "seller1",
+                    "url": f"https://www.ebay.com/itm/{category['category_id']}-1",
+                    "condition": "New",
+                    "price": "10.00",
+                    "search_query": "",
+                    "crawl_mode": "category",
+                    "crawl_category_id": category["category_id"],
+                    "crawl_category_name": category["category_name"],
+                    "crawl_category_path": category["category_path"],
+                }
+            ],
+        )
+
+        result = run_ebay(
+            settings=settings,
+            run_context=build_run_context(stage="ingest_ebay", source="ebay", run_id="run_test"),
+            logger=build_logger(),
+            storage_manager=storage_manager,
+            session=object(),
+        )
+
+        output_path = workspace / "data" / "ebay" / "ebay_listings.jsonl"
+        assert output_path.exists()
+        assert count_lines(output_path) == 2
+        assert result.record_count == 2
+        assert result.file_count == 1
+        assert (
+            "reviewpulse-bucket",
+            "raw/ebay/current/ebay_listings.jsonl",
+        ) in storage_manager.client.objects
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
+def test_run_ebay_category_crawl_skips_failed_category_and_continues(monkeypatch: pytest.MonkeyPatch):
+    workspace = make_workspace("run_ebay_category_skip_failure")
+    try:
+        settings = replace(
+            build_test_settings(workspace),
+            ebay_search_queries=tuple(),
+            ebay_category_ids=("550",),
+            ebay_max_items_per_query=0,
+        )
+        storage_manager = build_storage_manager()
+
+        monkeypatch.setattr(
+            "src.ingestion.ebay.get_access_token",
+            lambda _settings, _session=None: "token",
+        )
+        monkeypatch.setattr(
+            "src.ingestion.ebay.discover_leaf_categories",
+            lambda **_kwargs: (
+                {"category_id": "551", "category_name": "Paintings", "category_path": "Art > Paintings"},
+                {"category_id": "553", "category_name": "Posters", "category_path": "Art > Prints > Posters"},
+            ),
+        )
+
+        def fake_fetch_category_items(category, **_kwargs):
+            if category["category_id"] == "551":
+                raise requests.HTTPError("500 Server Error")
+            return [
+                {
+                    "item_id": "553-1",
+                    "title": "Posters Item",
+                    "item_title": "Posters Item",
+                    "seller_rating": "99.0",
+                    "feedback_count": 10,
+                    "feedback_text": "Description",
+                    "category": "Posters",
+                    "primary_category": "Posters",
+                    "listing_date": "2026-04-22T00:00:00Z",
+                    "seller_id": "seller1",
+                    "url": "https://www.ebay.com/itm/553-1",
+                    "condition": "New",
+                    "price": "10.00",
+                    "search_query": "",
+                    "crawl_mode": "category",
+                    "crawl_category_id": "553",
+                    "crawl_category_name": "Posters",
+                    "crawl_category_path": "Art > Prints > Posters",
+                }
+            ]
+
+        monkeypatch.setattr("src.ingestion.ebay.fetch_category_items", fake_fetch_category_items)
+
+        result = run_ebay(
+            settings=settings,
+            run_context=build_run_context(stage="ingest_ebay", source="ebay", run_id="run_test"),
+            logger=build_logger(),
+            storage_manager=storage_manager,
+            session=object(),
+        )
+
+        output_path = workspace / "data" / "ebay" / "ebay_listings.jsonl"
+        assert output_path.exists()
+        assert count_lines(output_path) == 1
+        assert result.record_count == 1
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
 

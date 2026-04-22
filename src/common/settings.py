@@ -52,6 +52,13 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+def _bool_env(name: str, default: bool = False) -> bool:
+    raw_value = os.getenv(name, "").strip().lower()
+    if not raw_value:
+        return default
+    return raw_value in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     project_root: Path
@@ -82,8 +89,11 @@ class Settings:
     ebay_dev_id: str
     ebay_cert_id: str
     ebay_site_id: str
+    ebay_environment: str
     ebay_marketplace_id: str
     ebay_search_queries: tuple[str, ...]
+    ebay_category_ids: tuple[str, ...]
+    ebay_crawl_all_categories: bool
     ebay_max_items_per_query: int
     ifixit_base_url: str
     ifixit_guide_ids: tuple[str, ...]
@@ -132,6 +142,14 @@ def get_settings() -> Settings:
         yelp_dataset_path = None
     else:
         yelp_dataset_path = _resolve_optional_project_path(yelp_dataset_raw)
+    ebay_app_id = os.getenv("EBAY_APP_ID", "").strip()
+    ebay_cert_id = os.getenv("EBAY_CERT_ID", "").strip()
+    ebay_environment = os.getenv("EBAY_ENVIRONMENT", "").strip().lower()
+    if ebay_environment not in {"production", "sandbox"}:
+        if "-SBX-" in ebay_app_id or ebay_cert_id.startswith("SBX-") or "-SBX-" in ebay_cert_id:
+            ebay_environment = "sandbox"
+        else:
+            ebay_environment = "production"
 
     return Settings(
         project_root=PROJECT_ROOT,
@@ -158,12 +176,15 @@ def get_settings() -> Settings:
         amazon_max_records=_int_env("AMAZON_MAX_RECORDS", 0),
         yelp_dataset_path=yelp_dataset_path,
         yelp_dataset_s3_uri=yelp_dataset_s3_uri or None,
-        ebay_app_id=os.getenv("EBAY_APP_ID", "").strip(),
+        ebay_app_id=ebay_app_id,
         ebay_dev_id=os.getenv("EBAY_DEV_ID", "").strip(),
-        ebay_cert_id=os.getenv("EBAY_CERT_ID", "").strip(),
+        ebay_cert_id=ebay_cert_id,
         ebay_site_id=os.getenv("EBAY_SITE_ID", "0").strip(),
+        ebay_environment=ebay_environment,
         ebay_marketplace_id=os.getenv("EBAY_MARKETPLACE_ID", "EBAY_US").strip(),
         ebay_search_queries=_csv_env("EBAY_SEARCH_QUERIES"),
+        ebay_category_ids=_csv_env("EBAY_CATEGORY_IDS"),
+        ebay_crawl_all_categories=_bool_env("EBAY_CRAWL_ALL_CATEGORIES", False),
         ebay_max_items_per_query=_int_env("EBAY_MAX_ITEMS_PER_QUERY", 50),
         ifixit_base_url=os.getenv("IFIXIT_BASE_URL", "https://www.ifixit.com").strip(),
         ifixit_guide_ids=_csv_env("IFIXIT_GUIDE_IDS"),
