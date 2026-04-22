@@ -415,6 +415,14 @@ def _directory_has_jsonl_files(path: Path) -> bool:
     return any(candidate.is_file() and candidate.suffix.lower() == ".jsonl" for candidate in path.iterdir())
 
 
+def _amazon_run_has_batch_files(run_dir: Path) -> bool:
+    return any(run_dir.glob("amazon_reviews_batch_*.jsonl"))
+
+
+def _amazon_run_uses_legacy_batch_names(run_dir: Path) -> bool:
+    return any(run_dir.glob("amazon_reviews_batch_*_size_*.jsonl"))
+
+
 def _load_json_file(path: Path) -> dict[str, Any] | None:
     if not path.exists() or not path.is_file():
         return None
@@ -428,16 +436,28 @@ def _load_json_file(path: Path) -> dict[str, Any] | None:
 def resolve_amazon_source_path(base_dir: Path) -> Optional[Path]:
     runs_dir = (base_dir / "amazon" / "runs").resolve()
     latest_completed: tuple[float, Path] | None = None
+    latest_legacy: tuple[float, Path] | None = None
     if runs_dir.exists() and runs_dir.is_dir():
         for run_dir in runs_dir.iterdir():
             if not run_dir.is_dir():
                 continue
-            if not any(run_dir.glob("amazon_reviews_batch_*.jsonl")):
+            if not _amazon_run_has_batch_files(run_dir):
                 continue
 
             checkpoint_payload = _load_json_file(run_dir / "_checkpoint.json") or {}
             manifest_exists = (run_dir / "manifest.json").exists()
             if not manifest_exists and not checkpoint_payload.get("completed"):
+                if _amazon_run_uses_legacy_batch_names(run_dir):
+                    sort_key = max(
+                        run_dir.stat().st_mtime,
+                        max(
+                            (path.stat().st_mtime for path in run_dir.glob("amazon_reviews_batch_*.jsonl")),
+                            default=0.0,
+                        ),
+                    )
+                    candidate = (sort_key, run_dir.resolve())
+                    if latest_legacy is None or candidate[0] > latest_legacy[0]:
+                        latest_legacy = candidate
                 continue
 
             sort_key = max(
@@ -451,6 +471,8 @@ def resolve_amazon_source_path(base_dir: Path) -> Optional[Path]:
 
     if latest_completed is not None:
         return latest_completed[1]
+    if latest_legacy is not None:
+        return latest_legacy[1]
 
     direct_path = find_first_existing_path(base_dir, AMAZON_FILE_CANDIDATES)
     if direct_path is not None:

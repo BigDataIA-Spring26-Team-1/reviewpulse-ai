@@ -88,7 +88,7 @@ from src.common.settings import get_settings
 from src.common.storage import S3StorageManager
 from src.common.structured_logging import configure_structured_logging, get_logger, log_event
 from src.common.run_context import PipelineRunContext, build_run_context
-from src.common.spark_runtime import ensure_local_hadoop_home
+from src.common.spark_runtime import ensure_local_hadoop_home, ensure_local_spark_dir
 from src.normalization.core import (
     AMAZON_FILE_CANDIDATES,
     EBAY_FILE_CANDIDATES,
@@ -108,11 +108,13 @@ def build_spark() -> Any:
         raise RuntimeError("Missing dependency: `pyspark`. " + DEPENDENCY_SETUP_HINT)
     settings = get_settings()
     hadoop_home = ensure_local_hadoop_home(PROJECT_ROOT)
+    spark_local_dir = ensure_local_spark_dir(PROJECT_ROOT)
     builder = (
         SparkSession.builder
         .appName("ReviewPulse-Normalization")
         .master(settings.spark_master)
         .config("spark.sql.session.timeZone", settings.spark_sql_session_timezone)
+        .config("spark.local.dir", str(spark_local_dir))
     )
     for env_name, spark_key in (
         ("SPARK_DRIVER_MEMORY", "spark.driver.memory"),

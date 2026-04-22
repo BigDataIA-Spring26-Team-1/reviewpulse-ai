@@ -62,6 +62,43 @@ def _compile_winutils_stub(output_path: Path) -> None:
         raise RuntimeError(f"winutils shim compilation did not produce {output_path}")
 
 
+def _resolve_runtime_path(project_root: Path, configured_path: str) -> Path:
+    raw_path = Path(configured_path)
+    if raw_path.is_absolute():
+        return raw_path.resolve()
+    return (project_root / raw_path).resolve()
+
+
+def _ensure_writable_directory(path: Path) -> bool:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe_path = path / ".spark-write-probe"
+        probe_path.write_text("ok", encoding="utf-8")
+        probe_path.unlink(missing_ok=True)
+        return True
+    except OSError:
+        return False
+
+
+def ensure_local_spark_dir(project_root: Path) -> Path:
+    configured_dir = os.getenv("SPARK_LOCAL_DIR", "").strip() or os.getenv("SPARK_LOCAL_DIRS", "").strip()
+    fallback_dir = (project_root / ".runtime" / "spark-local").resolve()
+    candidate_dirs: list[Path] = []
+
+    if configured_dir:
+        candidate_dirs.append(_resolve_runtime_path(project_root, configured_dir))
+    candidate_dirs.append(fallback_dir)
+
+    for candidate_dir in candidate_dirs:
+        if not _ensure_writable_directory(candidate_dir):
+            continue
+        os.environ["SPARK_LOCAL_DIR"] = str(candidate_dir)
+        os.environ["SPARK_LOCAL_DIRS"] = str(candidate_dir)
+        return candidate_dir
+
+    raise RuntimeError("Spark requires a writable local directory, but none were available.")
+
+
 def ensure_local_hadoop_home(project_root: Path) -> Path | None:
     if os.name != "nt":
         return None

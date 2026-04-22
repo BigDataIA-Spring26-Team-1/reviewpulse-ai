@@ -143,6 +143,27 @@ class TestAmazonNormalization:
         finally:
             shutil.rmtree(workspace, ignore_errors=True)
 
+    def test_resolve_amazon_source_path_falls_back_to_legacy_run_dir(self):
+        workspace = Path(__file__).resolve().parent / "_tmp_normalization" / "amazon_legacy_run"
+        shutil.rmtree(workspace, ignore_errors=True)
+        try:
+            run_dir = workspace / "amazon" / "runs" / "run_legacy"
+            run_dir.mkdir(parents=True, exist_ok=True)
+            (run_dir / "amazon_reviews_batch_00000_size_010000.jsonl").write_text(
+                '{"asin":"B001","user_id":"u1","rating":5.0}\n',
+                encoding="utf-8",
+            )
+            (run_dir / "amazon_reviews_batch_00001_size_010000.jsonl").write_text(
+                '{"asin":"B002","user_id":"u2","rating":4.0}\n',
+                encoding="utf-8",
+            )
+
+            resolved = resolve_amazon_source_path(workspace)
+
+            assert resolved == run_dir.resolve()
+        finally:
+            shutil.rmtree(workspace, ignore_errors=True)
+
     def test_spark_optional_column_defaults_missing_field_to_null_literal(self, monkeypatch: pytest.MonkeyPatch):
         operations: list[tuple[str, object]] = []
 
