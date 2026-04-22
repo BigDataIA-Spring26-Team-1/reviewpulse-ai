@@ -32,7 +32,7 @@ The checked-in repository currently implements this flow:
 | Layer | Components |
 |-------|------------|
 | Data Sources | Amazon sample data, eBay POC pipeline, Yelp dataset, iFixit POC pipeline, YouTube transcripts, optional Reddit connector |
-| Raw / Intermediate Storage | Local files under `data/` |
+| Raw / Intermediate Storage | Local files under `data/` with optional S3 run/current publishing |
 | Processing | PySpark normalization, cleaning, and sentiment enrichment |
 | ML / NLP | Ollama aspect extraction POC, sentence-transformers embeddings, ChromaDB retrieval |
 | Structured / Vector Access | Local parquet files and ChromaDB |
@@ -54,7 +54,7 @@ Amazon/eBay/Yelp/iFixit/YouTube/Reddit
 
 ### Note on the project diagrams
 
-The project diagrams describe a larger target architecture involving cloud storage, warehouses, and caches. The current repository runs locally and does not currently wire up BigQuery, Snowflake, Redis, S3, or Gemini in the checked-in application code.
+The project diagrams describe a larger target architecture involving cloud services, warehouses, and caches. The current repository is still local-first, but it now includes optional S3 publishing for raw and processed artifacts plus Airflow DAG definitions for orchestration. BigQuery, Snowflake, Redis, and Gemini remain planned rather than fully wired into the checked-in application flow.
 
 ---
 
@@ -118,7 +118,7 @@ Normalization formulas:
 | ChromaDB | Persistent local vector store |
 | FastAPI | Simple typed API layer |
 | Streamlit | Fast Python-native dashboard |
-| Airflow | Planned orchestration target for a fuller pipeline |
+| Airflow | Local orchestration for the full-ingestion and reprocessing DAGs |
 
 ---
 
@@ -224,6 +224,128 @@ poetry run streamlit run src/frontend/app.py
 ```
 
 FastAPI docs: `http://127.0.0.1:8000/docs`
+
+---
+
+## Local Airflow
+
+The repository now includes two Airflow DAGs under [`dags/`](./dags):
+
+- `reviewpulse_pipeline`: full ingestion + normalization + sentiment + embeddings + tests
+- `reviewpulse_reprocess_pipeline`: rebuild normalized and downstream artifacts from already-ingested raw data
+
+For local use, run Airflow from the same environment that has this project’s dependencies available. Because Apache Airflow is not officially supported on native Windows, use WSL2 or Docker if you are developing on Windows.
+
+### Docker quick start
+
+This repository includes a local Docker-based Airflow setup in [`docker/airflow/`](./docker/airflow) that builds on the official Apache Airflow image. The image boots Airflow quickly and includes a separate one-time bootstrap script for the heavier ReviewPulse runtime dependencies.
+
+Start it with:
+
+```bash
+docker compose -f docker/airflow/docker-compose.yaml build
+docker compose -f docker/airflow/docker-compose.yaml up -d
+```
+
+Then open `http://localhost:8080`.
+
+When you are ready to execute the DAG tasks themselves, bootstrap the project runtime once inside the container:
+
+```bash
+docker compose -f docker/airflow/docker-compose.yaml exec airflow bash /opt/reviewpulse/docker/airflow/bootstrap-project-venv.sh
+```
+
+That bootstrap step installs the project's Spark/ML dependencies into a persistent venv under `./.airflow-docker/`, so it can take a while the first time.
+
+Useful commands:
+
+```bash
+docker compose -f docker/airflow/docker-compose.yaml logs -f
+docker compose -f docker/airflow/docker-compose.yaml exec airflow airflow dags list
+docker compose -f docker/airflow/docker-compose.yaml exec airflow airflow dags trigger reviewpulse_pipeline
+docker compose -f docker/airflow/docker-compose.yaml exec airflow airflow dags trigger reviewpulse_reprocess_pipeline
+docker compose -f docker/airflow/docker-compose.yaml down
+```
+
+The Docker stack persists Airflow state in `./.airflow-docker/`.
+
+### Single-Node Deployment
+
+For a first deployment on a Linux VM, reuse the same container image with a persistent Airflow volume and a dedicated deploy env file.
+
+1. Copy [`docker/airflow/.env.deploy.example`](./docker/airflow/.env.deploy.example) to `docker/airflow/.env.deploy`.
+2. Fill in at least:
+   - `AIRFLOW_ADMIN_PASSWORD`
+   - your AWS/S3 settings if you want raw/processed publishing
+   - whichever source credentials you actually plan to run
+3. Start the deployed stack:
+
+```bash
+docker compose \
+  --env-file docker/airflow/.env.deploy \
+  -f docker/airflow/docker-compose.deploy.yaml \
+  up -d --build
+```
+
+This deployment path uses:
+
+- [`docker/airflow/docker-compose.deploy.yaml`](./docker/airflow/docker-compose.deploy.yaml) for the server container
+- [`docker/airflow/run-airflow-standalone.sh`](./docker/airflow/run-airflow-standalone.sh) to bootstrap the ReviewPulse runtime and create the Airflow login on first start
+- a persistent Docker volume for `/opt/airflow`
+- a persistent Docker volume for `/opt/reviewpulse/data`
+
+Useful deployment commands:
+
+```bash
+docker compose --env-file docker/airflow/.env.deploy -f docker/airflow/docker-compose.deploy.yaml logs -f
+docker compose --env-file docker/airflow/.env.deploy -f docker/airflow/docker-compose.deploy.yaml ps
+docker compose --env-file docker/airflow/.env.deploy -f docker/airflow/docker-compose.deploy.yaml down
+```
+
+This is a good single-node deployment for a VM. If you later want a more production-heavy setup with Postgres, a reverse proxy, and split Airflow services, we can build that on top of this same image.
+
+Recommended local environment variables:
+
+```bash
+AIRFLOW_HOME=./.airflow
+AIRFLOW__CORE__DAGS_FOLDER=./dags
+AIRFLOW__CORE__LOAD_EXAMPLES=False
+PYTHONPATH=.
+```
+
+Example local bootstrap flow after installing Airflow into your runtime environment:
+
+```bash
+poetry run airflow db migrate
+poetry run airflow users create \
+  --username admin \
+  --firstname ReviewPulse \
+  --lastname Admin \
+  --role Admin \
+  --email admin@example.com \
+  --password admin
+
+poetry run airflow webserver --port 8080
+poetry run airflow scheduler
+```
+
+Trigger the DAGs manually:
+
+```bash
+poetry run airflow dags trigger reviewpulse_pipeline
+poetry run airflow dags trigger reviewpulse_reprocess_pipeline
+```
+
+Useful validation commands:
+
+```bash
+poetry run airflow dags list
+poetry run airflow dags show reviewpulse_pipeline
+poetry run airflow dags show reviewpulse_reprocess_pipeline
+poetry run airflow dags list-import-errors
+```
+
+Use the reprocess DAG when raw source files are already present in `data/` or S3 and you only want to rebuild normalized parquet, sentiment output, embeddings, and test artifacts.
 
 ---
 

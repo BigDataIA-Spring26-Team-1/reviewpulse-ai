@@ -140,6 +140,7 @@ celerybeat.pid
 
 # Environments
 .env
+.env.deploy
 .envrc
 .venv
 env/
@@ -147,6 +148,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+docker/airflow/.env.deploy
 
 # Spyder project settings
 .spyderproject
@@ -207,6 +209,7 @@ cython_debug/
 
 # Project-local caches
 .rag_cache/
+.airflow-docker/
 
 # Frontend artifacts
 industrial-digital-twin/node_modules/

@@ -1,0 +1,19 @@
+services:
+  airflow:
+    build:
+      context: ../..
+      dockerfile: docker/airflow/Dockerfile
+    image: reviewpulse-airflow:local
+    container_name: reviewpulse-airflow
+    ports:
+      - "8080:8080"
+    environment:
+      AIRFLOW_HOME: /opt/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/reviewpulse/dags
+      PYTHONPATH: /opt/reviewpulse
+      REVIEWPULSE_PROJECT_PYTHON: /home/airflow/reviewpulse-venv/bin/python
+    volumes:
+      - ../../:/opt/reviewpulse
+      - ../../.airflow-docker:/opt/airflow
+    command: bash -lc "airflow standalone"
