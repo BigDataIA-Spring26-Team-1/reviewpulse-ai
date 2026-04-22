@@ -77,6 +77,7 @@ class Settings:
     amazon_batch_size: int
     amazon_max_records: int
     yelp_dataset_path: Path | None
+    yelp_dataset_s3_uri: str | None
     ebay_app_id: str
     ebay_dev_id: str
     ebay_cert_id: str
@@ -93,6 +94,16 @@ class Settings:
     @property
     def s3_enabled(self) -> bool:
         return bool(self.s3_bucket_name.strip())
+
+    @property
+    def yelp_dataset_source(self) -> str | Path | None:
+        if self.yelp_dataset_s3_uri:
+            return self.yelp_dataset_s3_uri
+        return self.yelp_dataset_path
+
+    @property
+    def has_yelp_dataset_source(self) -> bool:
+        return self.yelp_dataset_source is not None
 
 
 def get_settings() -> Settings:
@@ -114,6 +125,13 @@ def get_settings() -> Settings:
         os.getenv("CHROMA_PATH", "./data/chromadb_reviews"),
         "./data/chromadb_reviews",
     )
+    yelp_dataset_raw = os.getenv("YELP_DATASET_PATH", "").strip()
+    yelp_dataset_s3_uri = os.getenv("YELP_DATASET_S3_URI", "").strip()
+    if yelp_dataset_raw.startswith("s3://") and not yelp_dataset_s3_uri:
+        yelp_dataset_s3_uri = yelp_dataset_raw
+        yelp_dataset_path = None
+    else:
+        yelp_dataset_path = _resolve_optional_project_path(yelp_dataset_raw)
 
     return Settings(
         project_root=PROJECT_ROOT,
@@ -138,7 +156,8 @@ def get_settings() -> Settings:
         amazon_category=os.getenv("AMAZON_CATEGORY", "Electronics").strip(),
         amazon_batch_size=_int_env("AMAZON_BATCH_SIZE", 10000),
         amazon_max_records=_int_env("AMAZON_MAX_RECORDS", 0),
-        yelp_dataset_path=_resolve_optional_project_path(os.getenv("YELP_DATASET_PATH", "")),
+        yelp_dataset_path=yelp_dataset_path,
+        yelp_dataset_s3_uri=yelp_dataset_s3_uri or None,
         ebay_app_id=os.getenv("EBAY_APP_ID", "").strip(),
         ebay_dev_id=os.getenv("EBAY_DEV_ID", "").strip(),
         ebay_cert_id=os.getenv("EBAY_CERT_ID", "").strip(),

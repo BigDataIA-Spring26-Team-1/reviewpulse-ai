@@ -2,11 +2,12 @@
 ReviewPulse AI Airflow DAG for the ingestion and processing pipeline.
 
 This DAG runs the checked-in pipeline stages in order:
-1. Validate and normalize raw source data into a shared JSONL preview.
-2. Run the Spark normalization job for the core sources.
-3. Score sentiment.
-4. Build embeddings.
-5. Run tests.
+1. Optionally ingest Yelp raw data when YELP_DATASET_PATH or YELP_DATASET_S3_URI is configured.
+2. Validate and normalize raw source data into a shared JSONL preview.
+3. Run the Spark normalization job for the core sources.
+4. Score sentiment.
+5. Build embeddings.
+6. Run tests.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ import sys
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.common.settings import get_settings
 from src.common.structured_logging import configure_structured_logging, get_logger, log_event
 
 DAG_STRUCTURE = """
@@ -33,6 +35,8 @@ DAG: reviewpulse_pipeline
 Schedule: Daily at 2 AM UTC
 
 Task Flow:
+    ingest_yelp (optional; only when Yelp source config is provided)
+        -> normalize_local_preview
     normalize_local_preview
         -> normalize_reviews_spark
         -> score_sentiment
@@ -93,6 +97,7 @@ def _log_airflow_task_failed(context: dict[str, Any]) -> None:
 
 def _build_dag() -> Any:
     DAG, BashOperator = _load_airflow_objects()
+    project_settings = get_settings()
 
     default_args = {
         "owner": "reviewpulse",
@@ -116,6 +121,17 @@ def _build_dag() -> Any:
             "REVIEWPULSE_DAG_ID": "{{ dag.dag_id }}",
             "REVIEWPULSE_TASK_ID": "{{ task.task_id }}",
         }
+
+        ingest_yelp = None
+        if project_settings.has_yelp_dataset_source:
+            ingest_yelp = BashOperator(
+                task_id="ingest_yelp",
+                bash_command=f"cd {PROJECT_ROOT_POSIX} && python -m src.ingestion.yelp",
+                env=task_env,
+                on_execute_callback=_log_airflow_task_started,
+                on_success_callback=_log_airflow_task_completed,
+                on_failure_callback=_log_airflow_task_failed,
+            )
 
         normalize_local_preview = BashOperator(
             task_id="normalize_local_preview",
@@ -161,6 +177,9 @@ def _build_dag() -> Any:
             on_success_callback=_log_airflow_task_completed,
             on_failure_callback=_log_airflow_task_failed,
         )
+
+        if ingest_yelp is not None:
+            ingest_yelp >> normalize_local_preview
 
         normalize_local_preview >> normalize_spark >> score_sentiment >> build_embeddings >> run_tests
 

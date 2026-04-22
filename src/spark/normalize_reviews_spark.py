@@ -99,6 +99,7 @@ from src.normalization.core import (
     YOUTUBE_FILE_CANDIDATES,
     find_first_existing_path,
     resolve_source_input_path,
+    resolve_yelp_source_paths,
 )
 
 
@@ -210,11 +211,12 @@ def normalize_amazon(spark: Any) -> tuple[Any | None, Path | None]:
 
 
 def normalize_yelp(spark: Any) -> tuple[Any | None, Path | None]:
-    reviews, review_path = _read_json(spark, YELP_REVIEW_FILE_CANDIDATES)
-    if reviews is None:
+    settings = get_settings()
+    review_path, business_path = resolve_yelp_source_paths(settings.data_dir)
+    if review_path is None:
         return None, None
 
-    business_path = find_first_existing_path(get_settings().data_dir, YELP_BUSINESS_FILE_CANDIDATES)
+    reviews = spark.read.json(str(review_path))
     if business_path:
         businesses = spark.read.json(str(business_path)).select("business_id", "name", "categories")
         reviews = reviews.join(businesses, on="business_id", how="left")

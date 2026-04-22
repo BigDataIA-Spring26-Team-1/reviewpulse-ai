@@ -26,11 +26,13 @@ AMAZON_FILE_CANDIDATES = (
     "amazon/amazon_reviews.jsonl",
 )
 YELP_REVIEW_FILE_CANDIDATES = (
+    "yelp/current/yelp_academic_dataset_review.json",
     "yelp/yelp_academic_dataset_review.json",
     "yelp/yelp_reviews.jsonl",
     "yelp_reviews.jsonl",
 )
 YELP_BUSINESS_FILE_CANDIDATES = (
+    "yelp/current/yelp_academic_dataset_business.json",
     "yelp/yelp_academic_dataset_business.json",
     "yelp/yelp_businesses.jsonl",
     "yelp_business.jsonl",
@@ -461,9 +463,99 @@ def resolve_amazon_source_path(base_dir: Path) -> Optional[Path]:
     return None
 
 
+def resolve_yelp_source_paths(base_dir: Path) -> tuple[Optional[Path], Optional[Path]]:
+    runs_dir = (base_dir / "yelp" / "runs").resolve()
+    latest_completed: tuple[float, Path, Path] | None = None
+    if runs_dir.exists() and runs_dir.is_dir():
+        for run_dir in runs_dir.iterdir():
+            if not run_dir.is_dir():
+                continue
+
+            review_path = (run_dir / "yelp_academic_dataset_review.json").resolve()
+            business_path = (run_dir / "yelp_academic_dataset_business.json").resolve()
+            manifest_path = (run_dir / "manifest.json").resolve()
+            if not (review_path.exists() and business_path.exists() and manifest_path.exists()):
+                continue
+
+            sort_key = max(
+                run_dir.stat().st_mtime,
+                review_path.stat().st_mtime,
+                business_path.stat().st_mtime,
+                manifest_path.stat().st_mtime,
+            )
+            candidate = (sort_key, review_path, business_path)
+            if latest_completed is None or candidate[0] > latest_completed[0]:
+                latest_completed = candidate
+
+    if latest_completed is not None:
+        return latest_completed[1], latest_completed[2]
+
+    paired_candidates = (
+        (
+            "yelp/current/yelp_academic_dataset_review.json",
+            "yelp/current/yelp_academic_dataset_business.json",
+        ),
+        (
+            "yelp/yelp_academic_dataset_review.json",
+            "yelp/yelp_academic_dataset_business.json",
+        ),
+        (
+            "yelp/yelp_reviews.jsonl",
+            "yelp/yelp_businesses.jsonl",
+        ),
+        (
+            "yelp_reviews.jsonl",
+            "yelp_business.jsonl",
+        ),
+    )
+
+    for review_candidate, business_candidate in paired_candidates:
+        review_path = (base_dir / review_candidate).resolve()
+        business_path = (base_dir / business_candidate).resolve()
+        if review_path.exists() and business_path.exists():
+            return review_path, business_path
+
+    settings = get_settings()
+    configured_dataset_path = settings.yelp_dataset_path
+    if configured_dataset_path is not None:
+        resolved = configured_dataset_path.resolve()
+        if resolved.exists():
+            if resolved.is_dir():
+                review_filename = "yelp_academic_dataset_review.json"
+                business_filename = "yelp_academic_dataset_business.json"
+                review_path = (resolved / review_filename).resolve() if (resolved / review_filename).exists() else None
+                business_path = (
+                    (resolved / business_filename).resolve()
+                    if (resolved / business_filename).exists()
+                    else None
+                )
+            elif resolved.name == "yelp_academic_dataset_review.json":
+                review_path = resolved
+                business_candidate = (resolved.parent / "yelp_academic_dataset_business.json").resolve()
+                business_path = business_candidate if business_candidate.exists() else None
+            elif resolved.name == "yelp_academic_dataset_business.json":
+                business_path = resolved
+                review_candidate = (resolved.parent / "yelp_academic_dataset_review.json").resolve()
+                review_path = review_candidate if review_candidate.exists() else None
+            else:
+                review_path = None
+                business_path = None
+
+            if review_path is not None and business_path is not None:
+                return review_path, business_path
+
+    return (
+        find_first_existing_path(base_dir, YELP_REVIEW_FILE_CANDIDATES),
+        find_first_existing_path(base_dir, YELP_BUSINESS_FILE_CANDIDATES),
+    )
+
+
 def resolve_source_input_path(base_dir: Path, source: str, candidates: Sequence[str]) -> Optional[Path]:
     if source == "amazon":
         return resolve_amazon_source_path(base_dir)
+    if source == "yelp":
+        review_path, _ = resolve_yelp_source_paths(base_dir)
+        return review_path
     return find_first_existing_path(base_dir, candidates)
 
 
@@ -630,7 +722,7 @@ def run_local_normalization(
             status="success",
         )
 
-    yelp_review_path = find_first_existing_path(settings.data_dir, YELP_REVIEW_FILE_CANDIDATES)
+    yelp_review_path, yelp_business_path = resolve_yelp_source_paths(settings.data_dir)
     if yelp_review_path:
         source_started_at = time.perf_counter()
         log_event(
@@ -644,7 +736,6 @@ def run_local_normalization(
             input_path=str(yelp_review_path),
             status="started",
         )
-        yelp_business_path = find_first_existing_path(settings.data_dir, YELP_BUSINESS_FILE_CANDIDATES)
         business_lookup = load_yelp_business_lookup(yelp_business_path) if yelp_business_path else {}
         yelp_records = [
             normalize_yelp(row, business_lookup)

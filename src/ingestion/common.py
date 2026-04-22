@@ -108,6 +108,44 @@ def upload_source_file(
     return target_uri
 
 
+def copy_source_object(
+    *,
+    source: str,
+    source_uri: str,
+    destination_uri: str,
+    storage_manager: S3StorageManager,
+    run_context: PipelineRunContext,
+    logger: Any,
+) -> str:
+    log_event(
+        logger,
+        "s3_upload_started",
+        source=source,
+        stage=run_context.stage,
+        run_id=run_context.run_id,
+        dag_id=run_context.dag_id,
+        task_id=run_context.task_id,
+        input_path=source_uri,
+        output_path=destination_uri,
+        status="started",
+    )
+    storage_manager.copy_object(source_uri, destination_uri)
+    log_event(
+        logger,
+        "s3_upload_completed",
+        source=source,
+        stage=run_context.stage,
+        run_id=run_context.run_id,
+        dag_id=run_context.dag_id,
+        task_id=run_context.task_id,
+        input_path=source_uri,
+        output_path=destination_uri,
+        file_count=1,
+        status="success",
+    )
+    return destination_uri
+
+
 def promote_source_run(
     *,
     source: str,

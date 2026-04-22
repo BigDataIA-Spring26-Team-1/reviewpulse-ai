@@ -179,6 +179,7 @@ cp .env.example .env
 
 Current variables in `.env.example`:
 - `ANTHROPIC_API_KEY` and `ANTHROPIC_MODEL` for optional LLM-backed `/chat` answers
+- `YELP_DATASET_PATH` for a local Yelp Open Dataset directory, or `YELP_DATASET_S3_URI` for an S3 prefix containing the review and business JSON files
 - `OLLAMA_HOST` for `poc/aspect_extraction.py`
 - `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET`, and `REDDIT_USER_AGENT` for `poc/reddit_connector.py`
 
@@ -189,15 +190,18 @@ If no Anthropic key is configured, the chat endpoint falls back to a grounded ex
 ### 3. Run the pipeline end to end
 
 ```bash
-# Step 1: Generate or ingest source data
-# Amazon sample generation / profiling
-poetry run python poc/eda_amazon.py
+# Step 1: Ingest raw source data
+# Yelp requires either YELP_DATASET_PATH or YELP_DATASET_S3_URI.
+poetry run python src/ingestion/yelp.py
+
+# Amazon full-batch ingestion
+poetry run python src/ingestion/amazon.py
 
 # Optional demo/POC sources
 poetry run python poc/youtube_extractor.py
 poetry run python poc/reddit_connector.py
 
-# Step 2: Normalize into unified schema
+# Step 2: Build the local JSONL preview
 poetry run python poc/normalize_schema.py
 
 # Step 3: Build Spark parquet output

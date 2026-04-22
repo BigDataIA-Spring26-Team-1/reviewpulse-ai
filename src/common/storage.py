@@ -119,6 +119,46 @@ class S3StorageManager:
         bucket, key = parse_s3_uri(destination_uri)
         self.client.upload_file(str(local_path), bucket, key)
         return destination_uri
+
+    def copy_object(self, source_uri: str, destination_uri: str) -> str:
+        source_bucket, source_key = parse_s3_uri(source_uri)
+        destination_bucket, destination_key = parse_s3_uri(destination_uri)
+        self.client.copy_object(
+            Bucket=destination_bucket,
+            Key=destination_key,
+            CopySource={"Bucket": source_bucket, "Key": source_key},
+        )
+        return destination_uri
+
+    def download_file(self, source_uri: str, local_path: Path) -> Path:
+        bucket, key = parse_s3_uri(source_uri)
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        self.client.download_file(bucket, key, str(local_path))
+        return local_path
+
+    def count_lines(self, source_uri: str, *, chunk_size: int = 1024 * 1024) -> int:
+        bucket, key = parse_s3_uri(source_uri)
+        response = self.client.get_object(Bucket=bucket, Key=key)
+        body = response["Body"]
+        line_count = 0
+        saw_bytes = False
+        ended_with_newline = False
+
+        try:
+            for chunk in body.iter_chunks(chunk_size=chunk_size):
+                if not chunk:
+                    continue
+                saw_bytes = True
+                line_count += chunk.count(b"\n")
+                ended_with_newline = chunk.endswith(b"\n")
+        finally:
+            close = getattr(body, "close", None)
+            if callable(close):
+                close()
+
+        if saw_bytes and not ended_with_newline:
+            line_count += 1
+        return line_count
  
     def upload_directory(self, local_dir: Path, destination_prefix: str) -> list[str]:
         if not local_dir.exists() or not local_dir.is_dir():

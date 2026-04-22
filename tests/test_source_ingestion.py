@@ -18,7 +18,13 @@ from src.ingestion.common import count_lines
 from src.ingestion.ebay import map_item_summary, run as run_ebay
 from src.ingestion.ifixit import map_guide_payload
 from src.ingestion.youtube import build_record, resolve_video_ids
-from src.ingestion.yelp import BUSINESS_FILENAME, REVIEW_FILENAME, resolve_yelp_source_files, run as run_yelp
+from src.ingestion.yelp import (
+    BUSINESS_FILENAME,
+    REVIEW_FILENAME,
+    resolve_yelp_source_files,
+    resolve_yelp_source_uris,
+    run as run_yelp,
+)
 from tests.test_storage_foundation import FakeS3Client
 
 
@@ -55,6 +61,7 @@ def build_test_settings(workspace: Path) -> Settings:
         amazon_batch_size=2,
         amazon_max_records=0,
         yelp_dataset_path=None,
+        yelp_dataset_s3_uri=None,
         ebay_app_id="app-id",
         ebay_dev_id="dev-id",
         ebay_cert_id="cert-id",
@@ -162,6 +169,18 @@ def test_resolve_yelp_source_files_accepts_directory():
         shutil.rmtree(workspace, ignore_errors=True)
 
 
+def test_resolve_yelp_source_uris_accepts_prefix_and_review_file():
+    prefix_review_uri, prefix_business_uri = resolve_yelp_source_uris("s3://source-bucket/yelp-open-dataset/")
+    assert prefix_review_uri == "s3://source-bucket/yelp-open-dataset/yelp_academic_dataset_review.json"
+    assert prefix_business_uri == "s3://source-bucket/yelp-open-dataset/yelp_academic_dataset_business.json"
+
+    review_uri, business_uri = resolve_yelp_source_uris(
+        "s3://source-bucket/yelp-open-dataset/yelp_academic_dataset_review.json"
+    )
+    assert review_uri == "s3://source-bucket/yelp-open-dataset/yelp_academic_dataset_review.json"
+    assert business_uri == "s3://source-bucket/yelp-open-dataset/yelp_academic_dataset_business.json"
+
+
 def test_run_yelp_copies_and_publishes_source_files():
     workspace = make_workspace("run_yelp")
     try:
@@ -178,11 +197,69 @@ def test_run_yelp_copies_and_publishes_source_files():
             storage_manager=build_storage_manager(),
         )
 
-        local_review = workspace / "data" / "yelp" / REVIEW_FILENAME
+        run_dir = workspace / "data" / "yelp" / "runs" / "run_test"
+        local_review = run_dir / REVIEW_FILENAME
+        local_business = run_dir / BUSINESS_FILENAME
+        manifest_path = run_dir / "manifest.json"
+        assert not (workspace / "data" / "yelp" / REVIEW_FILENAME).exists()
+        assert not (workspace / "data" / "yelp" / BUSINESS_FILENAME).exists()
         assert local_review.exists()
+        assert local_business.exists()
+        assert manifest_path.exists()
         assert count_lines(local_review) == 2
         assert result.record_count == 2
-        assert result.file_count == 2
+        assert result.file_count == 3
+        assert result.local_paths[-1].name == "manifest.json"
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
+def test_run_yelp_downloads_from_s3_and_publishes_source_files():
+    workspace = make_workspace("run_yelp_s3")
+    try:
+        storage_manager = build_storage_manager()
+        storage_manager.client.objects[
+            ("source-bucket", "incoming/yelp/yelp_academic_dataset_review.json")
+        ] = b'{"review_id":"1"}\n{"review_id":"2"}\n'
+        storage_manager.client.objects[
+            ("source-bucket", "incoming/yelp/yelp_academic_dataset_business.json")
+        ] = b'{"business_id":"b1"}\n'
+
+        settings = replace(
+            build_test_settings(workspace),
+            yelp_dataset_s3_uri="s3://source-bucket/incoming/yelp/",
+        )
+        result = run_yelp(
+            settings=settings,
+            run_context=build_run_context(stage="ingest_yelp", source="yelp", run_id="run_test"),
+            logger=build_logger(),
+            storage_manager=storage_manager,
+        )
+
+        run_dir = workspace / "data" / "yelp" / "runs" / "run_test"
+        local_review = run_dir / REVIEW_FILENAME
+        local_business = run_dir / BUSINESS_FILENAME
+        manifest_path = run_dir / "manifest.json"
+        assert not (workspace / "data" / "yelp" / REVIEW_FILENAME).exists()
+        assert not (workspace / "data" / "yelp" / BUSINESS_FILENAME).exists()
+        assert not local_review.exists()
+        assert not local_business.exists()
+        assert manifest_path.exists()
+        assert result.record_count == 2
+        assert result.file_count == 3
+        assert result.local_paths == (manifest_path.resolve(),)
+        assert (
+            "reviewpulse-bucket",
+            "raw/yelp/current/yelp_academic_dataset_review.json",
+        ) in storage_manager.client.objects
+        assert (
+            "reviewpulse-bucket",
+            "raw/yelp/current/yelp_academic_dataset_business.json",
+        ) in storage_manager.client.objects
+        assert (
+            "reviewpulse-bucket",
+            "raw/yelp/current/manifest.json",
+        ) in storage_manager.client.objects
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
 

@@ -17,9 +17,25 @@ from src.common.structured_logging import configure_structured_logging, log_even
 class FakeS3Client:
     def __init__(self) -> None:
         self.objects: dict[tuple[str, str], bytes] = {}
+
+    class _Body:
+        def __init__(self, payload: bytes) -> None:
+            self.payload = payload
+
+        def iter_chunks(self, chunk_size: int = 1024 * 1024):
+            for offset in range(0, len(self.payload), chunk_size):
+                yield self.payload[offset:offset + chunk_size]
+
+        def close(self) -> None:
+            return None
  
     def upload_file(self, filename: str, bucket: str, key: str) -> None:
         self.objects[(bucket, key)] = Path(filename).read_bytes()
+
+    def download_file(self, bucket: str, key: str, filename: str) -> None:
+        path = Path(filename)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(self.objects[(bucket, key)])
  
     def list_objects_v2(self, Bucket: str, Prefix: str, ContinuationToken: str | None = None) -> dict:
         matching_keys = sorted(key for bucket, key in self.objects if bucket == Bucket and key.startswith(Prefix))
@@ -39,6 +55,13 @@ class FakeS3Client:
  
     def put_object(self, Bucket: str, Key: str, Body: bytes, ContentType: str | None = None) -> None:
         self.objects[(Bucket, Key)] = Body
+
+    def get_object(self, Bucket: str, Key: str) -> dict:
+        payload = self.objects[(Bucket, Key)]
+        return {
+            "Body": self._Body(payload),
+            "ContentLength": len(payload),
+        }
  
  
 def test_generate_run_id_includes_utc_timestamp():
@@ -110,6 +133,40 @@ def test_promote_run_prefix_replaces_current_and_writes_latest_marker():
         assert marker_payload["stage"] == "normalized_jsonl"
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_download_file_fetches_s3_object_to_local_path():
+    resolver = S3PathResolver(bucket="reviewpulse-bucket", raw_prefix="raw", processed_prefix="processed")
+    client = FakeS3Client()
+    manager = S3StorageManager(resolver, client)
+
+    temp_dir = Path(__file__).resolve().parent / "_tmp_storage_download"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        source_uri = "s3://reviewpulse-bucket/raw/yelp/current/yelp_academic_dataset_review.json"
+        client.objects[("reviewpulse-bucket", "raw/yelp/current/yelp_academic_dataset_review.json")] = (
+            b'{"review_id":"1"}\n'
+        )
+
+        local_path = temp_dir / "yelp_academic_dataset_review.json"
+        downloaded = manager.download_file(source_uri, local_path)
+
+        assert downloaded == local_path
+        assert local_path.read_text(encoding="utf-8") == '{"review_id":"1"}\n'
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_count_lines_streams_s3_object():
+    resolver = S3PathResolver(bucket="reviewpulse-bucket", raw_prefix="raw", processed_prefix="processed")
+    client = FakeS3Client()
+    manager = S3StorageManager(resolver, client)
+
+    client.objects[("reviewpulse-bucket", "raw/yelp/current/yelp_academic_dataset_review.json")] = (
+        b'{"review_id":"1"}\n{"review_id":"2"}\n'
+    )
+
+    assert manager.count_lines("s3://reviewpulse-bucket/raw/yelp/current/yelp_academic_dataset_review.json") == 2
 
 
 def test_promote_run_prefix_reports_progress():

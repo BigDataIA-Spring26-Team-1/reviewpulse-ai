@@ -27,6 +27,7 @@ from src.normalization.core import (
     normalize_yelp,
     normalize_youtube,
     resolve_amazon_source_path,
+    resolve_yelp_source_paths,
 )
 import src.spark.normalize_reviews_spark as spark_normalization
 
@@ -280,6 +281,127 @@ class TestYelpNormalization:
         )
         assert result["product_name"] == "North End Cafe"
         assert result["display_category"] == "Coffee & Tea"
+
+    def test_resolve_yelp_source_paths_prefers_current_pair_over_root_files(self):
+        workspace = Path(__file__).resolve().parent / "_tmp_normalization" / "yelp_prefers_current"
+        shutil.rmtree(workspace, ignore_errors=True)
+        try:
+            current_dir = workspace / "yelp" / "current"
+            current_dir.mkdir(parents=True, exist_ok=True)
+            (current_dir / "yelp_academic_dataset_review.json").write_text(
+                '{"review_id":"current"}\n',
+                encoding="utf-8",
+            )
+            (current_dir / "yelp_academic_dataset_business.json").write_text(
+                '{"business_id":"current"}\n',
+                encoding="utf-8",
+            )
+
+            root_dir = workspace / "yelp"
+            (root_dir / "yelp_academic_dataset_review.json").write_text(
+                '{"review_id":"root"}\n',
+                encoding="utf-8",
+            )
+            (root_dir / "yelp_academic_dataset_business.json").write_text(
+                '{"business_id":"root"}\n',
+                encoding="utf-8",
+            )
+
+            review_path, business_path = resolve_yelp_source_paths(workspace)
+
+            assert review_path == (current_dir / "yelp_academic_dataset_review.json").resolve()
+            assert business_path == (current_dir / "yelp_academic_dataset_business.json").resolve()
+        finally:
+            shutil.rmtree(workspace, ignore_errors=True)
+
+    def test_resolve_yelp_source_paths_prefers_completed_run_over_legacy_files(self):
+        workspace = Path(__file__).resolve().parent / "_tmp_normalization" / "yelp_prefers_run"
+        shutil.rmtree(workspace, ignore_errors=True)
+        try:
+            root_dir = workspace / "yelp"
+            root_dir.mkdir(parents=True, exist_ok=True)
+            (root_dir / "yelp_academic_dataset_review.json").write_text(
+                '{"review_id":"root"}\n',
+                encoding="utf-8",
+            )
+            (root_dir / "yelp_academic_dataset_business.json").write_text(
+                '{"business_id":"root"}\n',
+                encoding="utf-8",
+            )
+
+            run_dir = workspace / "yelp" / "runs" / "run_test"
+            run_dir.mkdir(parents=True, exist_ok=True)
+            (run_dir / "yelp_academic_dataset_review.json").write_text(
+                '{"review_id":"run"}\n',
+                encoding="utf-8",
+            )
+            (run_dir / "yelp_academic_dataset_business.json").write_text(
+                '{"business_id":"run"}\n',
+                encoding="utf-8",
+            )
+            (run_dir / "manifest.json").write_text(
+                json.dumps({"total_files": 2, "total_records": 1}),
+                encoding="utf-8",
+            )
+
+            review_path, business_path = resolve_yelp_source_paths(workspace)
+
+            assert review_path == (run_dir / "yelp_academic_dataset_review.json").resolve()
+            assert business_path == (run_dir / "yelp_academic_dataset_business.json").resolve()
+        finally:
+            shutil.rmtree(workspace, ignore_errors=True)
+
+    def test_resolve_yelp_source_paths_falls_back_to_root_pair(self):
+        workspace = Path(__file__).resolve().parent / "_tmp_normalization" / "yelp_root_pair"
+        shutil.rmtree(workspace, ignore_errors=True)
+        try:
+            root_dir = workspace / "yelp"
+            root_dir.mkdir(parents=True, exist_ok=True)
+            (root_dir / "yelp_academic_dataset_review.json").write_text(
+                '{"review_id":"root"}\n',
+                encoding="utf-8",
+            )
+            (root_dir / "yelp_academic_dataset_business.json").write_text(
+                '{"business_id":"root"}\n',
+                encoding="utf-8",
+            )
+
+            review_path, business_path = resolve_yelp_source_paths(workspace)
+
+            assert review_path == (root_dir / "yelp_academic_dataset_review.json").resolve()
+            assert business_path == (root_dir / "yelp_academic_dataset_business.json").resolve()
+        finally:
+            shutil.rmtree(workspace, ignore_errors=True)
+
+    def test_resolve_yelp_source_paths_falls_back_to_configured_dataset_dir(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        workspace = Path(__file__).resolve().parent / "_tmp_normalization" / "yelp_configured_dataset"
+        shutil.rmtree(workspace, ignore_errors=True)
+        try:
+            dataset_dir = workspace / "external_yelp_dataset"
+            dataset_dir.mkdir(parents=True, exist_ok=True)
+            (dataset_dir / "yelp_academic_dataset_review.json").write_text(
+                '{"review_id":"configured"}\n',
+                encoding="utf-8",
+            )
+            (dataset_dir / "yelp_academic_dataset_business.json").write_text(
+                '{"business_id":"configured"}\n',
+                encoding="utf-8",
+            )
+
+            monkeypatch.setattr(
+                "src.normalization.core.get_settings",
+                lambda: SimpleNamespace(yelp_dataset_path=dataset_dir.resolve()),
+            )
+
+            review_path, business_path = resolve_yelp_source_paths(workspace)
+
+            assert review_path == (dataset_dir / "yelp_academic_dataset_review.json").resolve()
+            assert business_path == (dataset_dir / "yelp_academic_dataset_business.json").resolve()
+        finally:
+            shutil.rmtree(workspace, ignore_errors=True)
 
 
 class TestEbayNormalization:
