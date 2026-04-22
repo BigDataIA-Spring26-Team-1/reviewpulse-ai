@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+import pyarrow.parquet as pq
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -25,6 +28,7 @@ from src.normalization.core import (
     normalize_youtube,
     resolve_amazon_source_path,
 )
+import src.spark.normalize_reviews_spark as spark_normalization
 
 
 class TestAmazonNormalization:
@@ -106,6 +110,125 @@ class TestAmazonNormalization:
             resolved = resolve_amazon_source_path(workspace)
 
             assert resolved == run_dir.resolve()
+        finally:
+            shutil.rmtree(workspace, ignore_errors=True)
+
+    def test_resolve_amazon_source_path_prefers_completed_run_over_legacy_file(self):
+        workspace = Path(__file__).resolve().parent / "_tmp_normalization" / "amazon_prefers_run"
+        shutil.rmtree(workspace, ignore_errors=True)
+        try:
+            legacy_file = workspace / "amazon" / "amazon_reviews.jsonl"
+            legacy_file.parent.mkdir(parents=True, exist_ok=True)
+            legacy_file.write_text('{"asin":"legacy"}\n', encoding="utf-8")
+
+            run_dir = workspace / "amazon" / "runs" / "run_test"
+            run_dir.mkdir(parents=True, exist_ok=True)
+            (run_dir / "amazon_reviews_batch_000001_records_00000001.jsonl").write_text(
+                '{"asin":"B001","user_id":"u1","rating":5.0}\n',
+                encoding="utf-8",
+            )
+            (run_dir / "manifest.json").write_text(
+                json.dumps({"total_batches": 1, "total_records": 1}),
+                encoding="utf-8",
+            )
+            (run_dir / "_checkpoint.json").write_text(
+                json.dumps({"completed": True, "cumulative_records": 1}),
+                encoding="utf-8",
+            )
+
+            resolved = resolve_amazon_source_path(workspace)
+
+            assert resolved == run_dir.resolve()
+        finally:
+            shutil.rmtree(workspace, ignore_errors=True)
+
+    def test_spark_optional_column_defaults_missing_field_to_null_literal(self, monkeypatch: pytest.MonkeyPatch):
+        operations: list[tuple[str, object]] = []
+
+        class FakeExpression:
+            def __init__(self, label: str) -> None:
+                self.label = label
+
+            def cast(self, cast_type: str):
+                operations.append(("cast", cast_type))
+                return f"{self.label}.cast({cast_type})"
+
+        monkeypatch.setattr(
+            spark_normalization,
+            "col",
+            lambda column_name: operations.append(("col", column_name)) or FakeExpression(f"col({column_name})"),
+        )
+        monkeypatch.setattr(
+            spark_normalization,
+            "lit",
+            lambda value: operations.append(("lit", value)) or FakeExpression(f"lit({value})"),
+        )
+
+        expression = spark_normalization._optional_column(
+            SimpleNamespace(columns=["asin", "title"]),
+            "url",
+            cast_type="string",
+        )
+
+        assert expression == "lit(None).cast(string)"
+        assert operations == [
+            ("lit", None),
+            ("cast", "string"),
+        ]
+
+    def test_write_parquet_via_arrow_writes_partition_files(self):
+        workspace = Path(__file__).resolve().parent / "_tmp_normalization" / "arrow_parquet_writer"
+        shutil.rmtree(workspace, ignore_errors=True)
+        try:
+            output_path = workspace / "normalized_reviews_parquet"
+            schema = SimpleNamespace(
+                fields=[
+                    SimpleNamespace(name="review_id", dataType=SimpleNamespace(typeName=lambda: "string")),
+                    SimpleNamespace(name="rating_normalized", dataType=SimpleNamespace(typeName=lambda: "double")),
+                    SimpleNamespace(name="verified_purchase", dataType=SimpleNamespace(typeName=lambda: "boolean")),
+                ]
+            )
+
+            class FakeRow:
+                def __init__(self, payload: dict[str, object]) -> None:
+                    self._payload = payload
+
+                def asDict(self, recursive: bool = False) -> dict[str, object]:
+                    return dict(self._payload)
+
+            class FakeDataFrame:
+                def __init__(self) -> None:
+                    self.schema = schema
+
+                def toLocalIterator(self):
+                    return iter(
+                        [
+                            FakeRow({"review_id": "r1", "rating_normalized": 1.0, "verified_purchase": True}),
+                            FakeRow({"review_id": "r2", "rating_normalized": 0.5, "verified_purchase": None}),
+                            FakeRow({"review_id": "r3", "rating_normalized": None, "verified_purchase": False}),
+                        ]
+                    )
+
+            logger = logging.getLogger("reviewpulse.tests.spark.arrow")
+            run_context = SimpleNamespace(stage="normalize_reviews_spark", run_id="run_test", dag_id=None, task_id=None)
+
+            record_count = spark_normalization._write_parquet_via_arrow(
+                FakeDataFrame(),
+                output_path,
+                logger=logger,
+                run_context=run_context,
+                batch_size=2,
+            )
+
+            files = sorted(output_path.glob("*.parquet"))
+            assert record_count == 3
+            assert [path.name for path in files] == ["part-00000.parquet", "part-00001.parquet"]
+            rows = []
+            for path in files:
+                rows.extend(pq.read_table(path).to_pylist())
+            assert rows[0]["review_id"] == "r1"
+            assert rows[1]["verified_purchase"] is None
+            assert rows[2]["verified_purchase"] is False
         finally:
             shutil.rmtree(workspace, ignore_errors=True)
 
