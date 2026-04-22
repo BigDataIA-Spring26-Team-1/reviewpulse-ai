@@ -25,6 +25,7 @@ from src.common.settings import get_settings
 from src.common.storage import S3StorageManager
 from src.common.structured_logging import configure_structured_logging, get_logger, log_event
 from src.common.run_context import build_run_context
+from src.common.spark_runtime import ensure_local_hadoop_home
 
 
 DEPENDENCY_SETUP_HINT = (
@@ -68,13 +69,16 @@ def _require_chromadb():
 def build_spark() -> Any:
     settings = get_settings()
     SparkSession = _require_pyspark()
-    return (
+    hadoop_home = ensure_local_hadoop_home(PROJECT_ROOT)
+    builder = (
         SparkSession.builder
         .appName("ReviewPulse-BuildEmbeddings")
         .master(settings.spark_master)
         .config("spark.sql.session.timeZone", settings.spark_sql_session_timezone)
-        .getOrCreate()
     )
+    if hadoop_home is not None:
+        builder = builder.config("spark.hadoop.hadoop.home.dir", str(hadoop_home))
+    return builder.getOrCreate()
 
 
 def main() -> None:

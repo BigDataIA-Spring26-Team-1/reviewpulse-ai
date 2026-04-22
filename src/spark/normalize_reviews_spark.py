@@ -12,11 +12,15 @@ from __future__ import annotations
 
 import importlib
 import logging
+import os
 import shutil
 import sys
 import time
 from pathlib import Path
 from typing import Any
+
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 
 DEPENDENCY_SETUP_HINT = (
@@ -45,7 +49,9 @@ try:
     to_timestamp = pyspark_functions.to_timestamp
     trim = pyspark_functions.trim
     when = pyspark_functions.when
+    row_number = pyspark_functions.row_number
     DoubleType = pyspark_types.DoubleType
+    Window = importlib.import_module("pyspark.sql.window").Window
     PYSPARK_AVAILABLE = True
 except ImportError:
     DataFrame = Any
@@ -69,7 +75,9 @@ except ImportError:
     to_timestamp = _missing_pyspark
     trim = _missing_pyspark
     when = _missing_pyspark
+    row_number = _missing_pyspark
     DoubleType = _missing_pyspark
+    Window = _missing_pyspark
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -80,6 +88,7 @@ from src.common.settings import get_settings
 from src.common.storage import S3StorageManager
 from src.common.structured_logging import configure_structured_logging, get_logger, log_event
 from src.common.run_context import PipelineRunContext, build_run_context
+from src.common.spark_runtime import ensure_local_hadoop_home
 from src.normalization.core import (
     AMAZON_FILE_CANDIDATES,
     EBAY_FILE_CANDIDATES,
@@ -97,13 +106,32 @@ def build_spark() -> Any:
     if not PYSPARK_AVAILABLE:
         raise RuntimeError("Missing dependency: `pyspark`. " + DEPENDENCY_SETUP_HINT)
     settings = get_settings()
-    return (
+    hadoop_home = ensure_local_hadoop_home(PROJECT_ROOT)
+    builder = (
         SparkSession.builder
         .appName("ReviewPulse-Normalization")
         .master(settings.spark_master)
         .config("spark.sql.session.timeZone", settings.spark_sql_session_timezone)
-        .getOrCreate()
     )
+    for env_name, spark_key in (
+        ("SPARK_DRIVER_MEMORY", "spark.driver.memory"),
+        ("SPARK_EXECUTOR_MEMORY", "spark.executor.memory"),
+        ("SPARK_DRIVER_MAX_RESULT_SIZE", "spark.driver.maxResultSize"),
+        ("SPARK_LOCAL_DIR", "spark.local.dir"),
+    ):
+        value = os.getenv(env_name, "").strip()
+        if value:
+            builder = builder.config(spark_key, value)
+
+    shuffle_partitions = os.getenv("SPARK_SQL_SHUFFLE_PARTITIONS", "").strip() or "800"
+    builder = (
+        builder
+        .config("spark.sql.shuffle.partitions", shuffle_partitions)
+        .config("spark.sql.adaptive.enabled", "true")
+    )
+    if hadoop_home is not None:
+        builder = builder.config("spark.hadoop.hadoop.home.dir", str(hadoop_home))
+    return builder.getOrCreate()
 
 
 def _read_json(spark: Any, candidates: tuple[str, ...]) -> tuple[Any | None, Path | None]:
@@ -139,10 +167,19 @@ def _scale_column(column_name: str, minimum: float, maximum: float):
     )
 
 
+def _optional_column(df: Any, column_name: str, *, cast_type: str | None = None) -> Any:
+    expression = col(column_name) if column_name in df.columns else lit(None)
+    if cast_type is not None:
+        expression = expression.cast(cast_type)
+    return expression
+
+
 def normalize_amazon(spark: Any) -> tuple[Any | None, Path | None]:
     df, path = _read_json(spark, AMAZON_FILE_CANDIDATES)
     if df is None:
         return None, None
+
+    url_column = _optional_column(df, "url", cast_type="string")
 
     amazon_df = df.select(
         concat_ws("_", lit("amazon"), col("asin"), col("user_id")).alias("review_id"),
@@ -159,8 +196,8 @@ def normalize_amazon(spark: Any) -> tuple[Any | None, Path | None]:
         col("verified_purchase").alias("verified_purchase"),
         col("helpful_vote").cast("int").alias("helpful_votes"),
         when(
-            col("url").isNotNull() & (trim(col("url")) != ""),
-            col("url"),
+            url_column.isNotNull() & (trim(url_column) != ""),
+            url_column,
         ).otherwise(concat_ws("", lit("https://amazon.com/dp/"), col("asin"))).alias("source_url"),
         when(
             col("title").isNotNull() & (trim(col("title")) != ""),
@@ -346,10 +383,93 @@ def add_feature_columns(df: Any) -> Any:
 
 
 def deduplicate_exact_reviews(df: Any) -> Any:
-    before_count = df.count()
-    deduplicated = df.dropDuplicates(["review_id"])
-    removed = before_count - deduplicated.count()
-    return deduplicated
+    dedup_window = Window.partitionBy("review_id").orderBy(col("review_date").desc_nulls_last())
+    return (
+        df
+        .repartition(col("review_id"))
+        .withColumn("_review_rank", row_number().over(dedup_window))
+        .filter(col("_review_rank") == 1)
+        .drop("_review_rank")
+    )
+
+
+def _arrow_type_for_spark_type(type_name: str) -> pa.DataType:
+    mapping = {
+        "string": pa.string(),
+        "double": pa.float64(),
+        "float": pa.float32(),
+        "long": pa.int64(),
+        "integer": pa.int32(),
+        "int": pa.int32(),
+        "short": pa.int16(),
+        "byte": pa.int8(),
+        "boolean": pa.bool_(),
+        "timestamp": pa.timestamp("us"),
+        "date": pa.date32(),
+    }
+    return mapping.get(type_name, pa.string())
+
+
+def _arrow_schema_from_spark_schema(schema: Any) -> pa.Schema:
+    return pa.schema(
+        [
+            pa.field(field.name, _arrow_type_for_spark_type(field.dataType.typeName()), nullable=True)
+            for field in schema.fields
+        ]
+    )
+
+
+def _write_parquet_via_arrow(
+    df: Any,
+    output_path: Path,
+    *,
+    logger: logging.Logger,
+    run_context: PipelineRunContext,
+    batch_size: int = 50_000,
+) -> int:
+    output_path = output_path.resolve()
+    shutil.rmtree(output_path, ignore_errors=True)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    part_index = 0
+    total_records = 0
+    buffered_rows: list[dict[str, Any]] = []
+    schema = _arrow_schema_from_spark_schema(df.schema)
+
+    def flush_batch(rows: list[dict[str, Any]]) -> None:
+        nonlocal part_index, total_records
+        if not rows:
+            return
+
+        table = pa.Table.from_pylist(rows, schema=schema)
+        part_path = output_path / f"part-{part_index:05d}.parquet"
+        pq.write_table(table, part_path, compression="snappy")
+        part_index += 1
+        total_records += len(rows)
+        log_event(
+            logger,
+            "parquet_write_progress",
+            stage=run_context.stage,
+            run_id=run_context.run_id,
+            dag_id=run_context.dag_id,
+            task_id=run_context.task_id,
+            output_path=str(output_path),
+            file_count=part_index,
+            record_count=total_records,
+            status="running",
+        )
+        rows.clear()
+
+    iterator = df.toLocalIterator()
+    for row in iterator:
+        buffered_rows.append(row.asDict(recursive=True))
+        if len(buffered_rows) >= batch_size:
+            flush_batch(buffered_rows)
+
+    flush_batch(buffered_rows)
+    if total_records <= 0:
+        raise RuntimeError("Spark normalization produced zero rows for parquet output.")
+    return total_records
 
 
 def _publish_normalized_parquet(
@@ -473,28 +593,6 @@ def main() -> None:
     for dataframe in dataframes[1:]:
         unified_df = unified_df.unionByName(dataframe)
 
-    feature_started_at = time.perf_counter()
-    log_event(
-        logger,
-        "feature_engineering_started",
-        stage=run_context.stage,
-        run_id=run_context.run_id,
-        dag_id=run_context.dag_id,
-        task_id=run_context.task_id,
-        status="started",
-    )
-    unified_df = add_feature_columns(unified_df)
-    log_event(
-        logger,
-        "feature_engineering_completed",
-        stage=run_context.stage,
-        run_id=run_context.run_id,
-        dag_id=run_context.dag_id,
-        task_id=run_context.task_id,
-        duration_ms=round((time.perf_counter() - feature_started_at) * 1000, 2),
-        status="success",
-    )
-
     dedup_started_at = time.perf_counter()
     pre_dedup_count = unified_df.count()
     log_event(
@@ -519,13 +617,45 @@ def main() -> None:
         record_count=post_dedup_count,
         duration_ms=round((time.perf_counter() - dedup_started_at) * 1000, 2),
         status="success",
+        removed_count=pre_dedup_count - post_dedup_count,
+    )
+
+    feature_started_at = time.perf_counter()
+    log_event(
+        logger,
+        "feature_engineering_started",
+        stage=run_context.stage,
+        run_id=run_context.run_id,
+        dag_id=run_context.dag_id,
+        task_id=run_context.task_id,
+        status="started",
+    )
+    unified_df = add_feature_columns(unified_df)
+    log_event(
+        logger,
+        "feature_engineering_completed",
+        stage=run_context.stage,
+        run_id=run_context.run_id,
+        dag_id=run_context.dag_id,
+        task_id=run_context.task_id,
+        duration_ms=round((time.perf_counter() - feature_started_at) * 1000, 2),
+        status="success",
     )
 
     if settings.normalized_parquet_path.exists():
         shutil.rmtree(settings.normalized_parquet_path)
 
     settings.normalized_parquet_path.parent.mkdir(parents=True, exist_ok=True)
-    unified_df.write.mode("overwrite").parquet(str(settings.normalized_parquet_path))
+    if os.name == "nt":
+        written_record_count = _write_parquet_via_arrow(
+            unified_df,
+            settings.normalized_parquet_path,
+            logger=logger,
+            run_context=run_context,
+        )
+    else:
+        unified_df.write.mode("overwrite").parquet(str(settings.normalized_parquet_path))
+        written_record_count = post_dedup_count
     _publish_normalized_parquet(storage_manager, logger, run_context, settings.normalized_parquet_path)
 
     spark.stop()
@@ -536,7 +666,7 @@ def main() -> None:
         run_id=run_context.run_id,
         dag_id=run_context.dag_id,
         task_id=run_context.task_id,
-        record_count=post_dedup_count,
+        record_count=written_record_count,
         output_path=str(settings.normalized_parquet_path),
         duration_ms=round((time.perf_counter() - started_at) * 1000, 2),
         status="success",
