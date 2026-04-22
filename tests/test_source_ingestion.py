@@ -24,7 +24,7 @@ from src.ingestion.ebay import (
     resolve_ebay_api_urls,
     run as run_ebay,
 )
-from src.ingestion.ifixit import map_guide_payload
+from src.ingestion.ifixit import map_guide_payload, resolve_guide_ids, run as run_ifixit
 from src.ingestion.youtube import build_record, resolve_video_ids
 from src.ingestion.yelp import (
     BUSINESS_FILENAME,
@@ -82,6 +82,7 @@ def build_test_settings(workspace: Path) -> Settings:
         ebay_max_items_per_query=2,
         ifixit_base_url="https://www.ifixit.com",
         ifixit_guide_ids=("12345",),
+        ifixit_max_guides=0,
         youtube_api_key="",
         youtube_video_ids=("https://youtu.be/abcdefghijk",),
         youtube_transcript_languages=("en",),
@@ -984,6 +985,197 @@ def test_map_guide_payload_preserves_ifixit_fields():
     assert record["repairability_score"] == 8
     assert record["author"] == "ifixit_author"
     assert record["review_text"] == "Battery replacement is straightforward."
+
+
+def test_resolve_guide_ids_uses_public_listing_when_max_guides_is_set():
+    workspace = make_workspace("resolve_ifixit_guides")
+    try:
+        settings = replace(
+            build_test_settings(workspace),
+            ifixit_guide_ids=tuple(),
+            ifixit_max_guides=3,
+        )
+
+        class FakeResponse:
+            def __init__(self, payload):
+                self._payload = payload
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self):
+                return self._payload
+
+        class FakeSession:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            def get(self, url: str, *, params: dict[str, object], timeout: int):
+                self.calls.append({"url": url, "params": params, "timeout": timeout})
+                return FakeResponse(
+                    [
+                        {"guideid": 300},
+                        {"guideid": 299},
+                        {"guideid": 298},
+                    ]
+                )
+
+        session = FakeSession()
+        guide_ids = resolve_guide_ids(settings, session=session)
+
+        assert guide_ids == ("300", "299", "298")
+        assert session.calls == [
+            {
+                "url": "https://www.ifixit.com/api/2.0/guides",
+                "params": {"order": "DESC", "offset": 0, "limit": 3},
+                "timeout": 30,
+            }
+        ]
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
+def test_run_ifixit_discovers_public_guides_and_publishes():
+    workspace = make_workspace("run_ifixit_public_guides")
+    try:
+        settings = replace(
+            build_test_settings(workspace),
+            ifixit_guide_ids=tuple(),
+            ifixit_max_guides=2,
+        )
+        storage_manager = build_storage_manager()
+
+        class FakeResponse:
+            def __init__(self, payload):
+                self._payload = payload
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self):
+                return self._payload
+
+        class FakeSession:
+            def get(
+                self,
+                url: str,
+                *,
+                params: dict[str, object] | None = None,
+                timeout: int,
+            ):
+                if url.endswith("/api/2.0/guides"):
+                    return FakeResponse([{"guideid": "200"}, {"guideid": "199"}])
+                if url.endswith("/api/2.0/guides/200"):
+                    return FakeResponse(
+                        {
+                            "guideid": "200",
+                            "title": "Guide 200",
+                            "subject": "Device 200",
+                            "category": "Phones",
+                            "summary": "Public guide 200",
+                            "repairability_score": 7,
+                        }
+                    )
+                if url.endswith("/api/2.0/guides/199"):
+                    return FakeResponse(
+                        {
+                            "guideid": "199",
+                            "title": "Guide 199",
+                            "subject": "Device 199",
+                            "category": "Tablets",
+                            "summary": "Public guide 199",
+                            "repairability_score": 8,
+                        }
+                    )
+                raise AssertionError(f"Unexpected URL: {url}")
+
+        result = run_ifixit(
+            settings=settings,
+            run_context=build_run_context(stage="ingest_ifixit", source="ifixit", run_id="run_test"),
+            logger=build_logger(),
+            storage_manager=storage_manager,
+            session=FakeSession(),
+        )
+
+        output_path = workspace / "data" / "ifixit" / "ifixit_guides.jsonl"
+        raw_output_path = workspace / "data" / "ifixit" / "ifixit_guides_raw.jsonl"
+        assert output_path.exists()
+        assert raw_output_path.exists()
+        assert count_lines(output_path) == 2
+        assert count_lines(raw_output_path) == 2
+        assert result.record_count == 2
+        assert (
+            "reviewpulse-bucket",
+            "raw/ifixit/current/ifixit_guides.jsonl",
+        ) in storage_manager.client.objects
+        assert (
+            "reviewpulse-bucket",
+            "raw/ifixit/current/ifixit_guides_raw.jsonl",
+        ) in storage_manager.client.objects
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
+def test_run_ifixit_skips_failed_guides_and_keeps_successes():
+    workspace = make_workspace("run_ifixit_skip_failure")
+    try:
+        settings = replace(
+            build_test_settings(workspace),
+            ifixit_guide_ids=("200", "199"),
+            ifixit_max_guides=0,
+        )
+        storage_manager = build_storage_manager()
+
+        class FakeResponse:
+            def __init__(self, payload):
+                self._payload = payload
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self):
+                return self._payload
+
+        class FakeSession:
+            def get(
+                self,
+                url: str,
+                *,
+                params: dict[str, object] | None = None,
+                timeout: int,
+            ):
+                if url.endswith("/api/2.0/guides/200"):
+                    raise requests.HTTPError("500 error")
+                if url.endswith("/api/2.0/guides/199"):
+                    return FakeResponse(
+                        {
+                            "guideid": "199",
+                            "title": "Guide 199",
+                            "subject": "Device 199",
+                            "category": "Tablets",
+                            "summary": "Public guide 199",
+                            "repairability_score": 8,
+                        }
+                    )
+                raise AssertionError(f"Unexpected URL: {url}")
+
+        result = run_ifixit(
+            settings=settings,
+            run_context=build_run_context(stage="ingest_ifixit", source="ifixit", run_id="run_test"),
+            logger=build_logger(),
+            storage_manager=storage_manager,
+            session=FakeSession(),
+        )
+
+        output_path = workspace / "data" / "ifixit" / "ifixit_guides.jsonl"
+        raw_output_path = workspace / "data" / "ifixit" / "ifixit_guides_raw.jsonl"
+        assert output_path.exists()
+        assert raw_output_path.exists()
+        assert count_lines(output_path) == 1
+        assert count_lines(raw_output_path) == 1
+        assert result.record_count == 1
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
 
 
 def test_resolve_video_ids_accepts_urls_and_ids():

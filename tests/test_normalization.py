@@ -18,6 +18,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.normalization.core import (
+    EBAY_FILE_CANDIDATES,
+    IFIXIT_FILE_CANDIDATES,
     UNIFIED_REVIEW_FIELDS,
     create_unified_record,
     normalize_amazon,
@@ -27,9 +29,12 @@ from src.normalization.core import (
     normalize_yelp,
     normalize_youtube,
     resolve_amazon_source_path,
+    resolve_source_input_path,
     resolve_yelp_source_paths,
 )
+from src.common.storage import S3PathResolver, S3StorageManager
 import src.spark.normalize_reviews_spark as spark_normalization
+from tests.test_storage_foundation import FakeS3Client
 
 
 class TestAmazonNormalization:
@@ -452,6 +457,54 @@ class TestEbayNormalization:
         )
         assert result["source_url"].endswith("/123456789")
 
+    @pytest.mark.parametrize(
+        ("source", "candidates", "key", "expected_relative_path"),
+        [
+            (
+                "ebay",
+                EBAY_FILE_CANDIDATES,
+                "raw/ebay/current/ebay_listings.jsonl",
+                Path("ebay") / "ebay_listings.jsonl",
+            ),
+            (
+                "ifixit",
+                IFIXIT_FILE_CANDIDATES,
+                "raw/ifixit/current/ifixit_guides.jsonl",
+                Path("ifixit") / "ifixit_guides.jsonl",
+            ),
+        ],
+    )
+    def test_resolve_source_input_path_downloads_current_s3_snapshot(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        source: str,
+        candidates: tuple[str, ...],
+        key: str,
+        expected_relative_path: Path,
+    ):
+        workspace = Path(__file__).resolve().parent / "_tmp_normalization" / f"{source}_s3_current"
+        shutil.rmtree(workspace, ignore_errors=True)
+        try:
+            client = FakeS3Client()
+            client.objects[("reviewpulse-bucket", key)] = b'{"id":"1"}\n'
+            storage_manager = S3StorageManager(
+                S3PathResolver(bucket="reviewpulse-bucket", raw_prefix="raw", processed_prefix="processed"),
+                client,
+            )
+
+            monkeypatch.setattr("src.normalization.core.get_settings", lambda: SimpleNamespace(s3_enabled=True))
+            monkeypatch.setattr(
+                "src.normalization.core.S3StorageManager.from_settings",
+                lambda _settings: storage_manager,
+            )
+
+            resolved = resolve_source_input_path(workspace, source, candidates)
+
+            assert resolved == (workspace / expected_relative_path).resolve()
+            assert resolved.read_text(encoding="utf-8") == '{"id":"1"}\n'
+        finally:
+            shutil.rmtree(workspace, ignore_errors=True)
+
 
 class TestIFixitNormalization:
     def test_score_8_maps_to_expected_value(self):
@@ -488,6 +541,17 @@ class TestIFixitNormalization:
             }
         )
         assert result["rating_normalized"] == 1.0
+
+    def test_unix_seconds_published_date_is_normalized(self):
+        result = normalize_ifixit(
+            {
+                "guide_id": "ifixit_215491",
+                "repairability_score": 8,
+                "review_text": "Battery replacement was straightforward.",
+                "published_date": 1776877222,
+            }
+        )
+        assert result["review_date"] == "2026-04-22T17:00:22+00:00"
 
 
 class TestRedditNormalization:

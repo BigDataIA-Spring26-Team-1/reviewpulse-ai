@@ -97,6 +97,7 @@ class Settings:
     ebay_max_items_per_query: int
     ifixit_base_url: str
     ifixit_guide_ids: tuple[str, ...]
+    ifixit_max_guides: int
     youtube_api_key: str
     youtube_video_ids: tuple[str, ...]
     youtube_transcript_languages: tuple[str, ...]
@@ -188,6 +189,7 @@ def get_settings() -> Settings:
         ebay_max_items_per_query=_int_env("EBAY_MAX_ITEMS_PER_QUERY", 50),
         ifixit_base_url=os.getenv("IFIXIT_BASE_URL", "https://www.ifixit.com").strip(),
         ifixit_guide_ids=_csv_env("IFIXIT_GUIDE_IDS"),
+        ifixit_max_guides=_int_env("IFIXIT_MAX_GUIDES", 0),
         youtube_api_key=os.getenv("YOUTUBE_API_KEY", "").strip(),
         youtube_video_ids=_csv_env("YOUTUBE_VIDEO_IDS"),
         youtube_transcript_languages=_csv_env("YOUTUBE_TRANSCRIPT_LANGUAGES") or ("en",),

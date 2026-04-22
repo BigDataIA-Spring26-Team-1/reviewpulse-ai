@@ -137,9 +137,23 @@ def build_spark() -> Any:
     return builder.getOrCreate()
 
 
+def _source_name_for_candidates(candidates: tuple[str, ...]) -> str:
+    if candidates == AMAZON_FILE_CANDIDATES:
+        return "amazon"
+    if candidates == EBAY_FILE_CANDIDATES:
+        return "ebay"
+    if candidates == IFIXIT_FILE_CANDIDATES:
+        return "ifixit"
+    if candidates == YOUTUBE_FILE_CANDIDATES:
+        return "youtube"
+    if candidates == REDDIT_FILE_CANDIDATES:
+        return "reddit"
+    return ""
+
+
 def _read_json(spark: Any, candidates: tuple[str, ...]) -> tuple[Any | None, Path | None]:
     settings = get_settings()
-    source_name = "amazon" if candidates == AMAZON_FILE_CANDIDATES else ""
+    source_name = _source_name_for_candidates(candidates)
     path = resolve_source_input_path(settings.data_dir, source_name, candidates)
     if not path:
         return None, None
@@ -255,17 +269,27 @@ def normalize_ebay(spark: Any) -> tuple[Any | None, Path | None]:
     if df is None:
         return None, None
 
+    feedback_text = _optional_column(df, "feedback_text", cast_type="string")
+    review_text = _optional_column(df, "review_text", cast_type="string")
+    listing_date = _optional_column(df, "listing_date", cast_type="string")
+    review_date = _optional_column(df, "review_date", cast_type="string")
+    seller_id = _optional_column(df, "seller_id", cast_type="string")
+    seller = _optional_column(df, "seller", cast_type="string")
+    reviewer_id = _optional_column(df, "reviewer_id", cast_type="string")
+    feedback_count = _optional_column(df, "feedback_count", cast_type="int")
+    helpful_votes = _optional_column(df, "helpful_votes", cast_type="int")
+
     ebay_df = df.select(
         concat_ws("_", lit("ebay"), coalesce(col("item_id"), lit("unknown"))).alias("review_id"),
         coalesce(col("title"), col("item_title"), col("item_id")).alias("product_name"),
         coalesce(col("category"), col("primary_category"), lit("unknown")).alias("product_category"),
         lit("ebay").alias("source"),
         _scale_column("seller_rating", 0.0, 100.0).alias("rating_normalized"),
-        coalesce(col("feedback_text"), col("review_text"), lit("")).alias("review_text"),
-        to_timestamp(coalesce(col("listing_date"), col("review_date"))).alias("review_date"),
-        coalesce(col("seller_id"), col("seller"), col("reviewer_id"), lit("unknown")).alias("reviewer_id"),
+        coalesce(feedback_text, review_text, lit("")).alias("review_text"),
+        to_timestamp(coalesce(listing_date, review_date)).alias("review_date"),
+        coalesce(seller_id, seller, reviewer_id, lit("unknown")).alias("reviewer_id"),
         lit(None).cast("boolean").alias("verified_purchase"),
-        coalesce(col("feedback_count"), col("helpful_votes")).cast("int").alias("helpful_votes"),
+        coalesce(feedback_count, helpful_votes).cast("int").alias("helpful_votes"),
         when(
             col("url").isNotNull() & (trim(col("url")) != ""),
             col("url"),
@@ -282,23 +306,41 @@ def normalize_ifixit(spark: Any) -> tuple[Any | None, Path | None]:
     if df is None:
         return None, None
 
+    guide_id = _optional_column(df, "guide_id", cast_type="string")
+    source_id = _optional_column(df, "source_id", cast_type="string")
+    device_name = _optional_column(df, "device_name", cast_type="string")
+    title = _optional_column(df, "title", cast_type="string")
+    device_category = _optional_column(df, "device_category", cast_type="string")
+    review_text = _optional_column(df, "review_text", cast_type="string")
+    text = _optional_column(df, "text", cast_type="string")
+    published_date = _optional_column(df, "published_date")
+    created_date = _optional_column(df, "created_date")
+    author = _optional_column(df, "author", cast_type="string")
+    helpful_votes = _optional_column(df, "helpful_votes", cast_type="int")
+    url = _optional_column(df, "url", cast_type="string")
+
     ifixit_df = df.select(
-        concat_ws("_", lit("ifixit"), coalesce(col("guide_id"), col("source_id"), lit("unknown"))).alias("review_id"),
-        coalesce(col("device_name"), col("title"), col("guide_id")).alias("product_name"),
-        coalesce(col("device_category"), lit("repairability")).alias("product_category"),
+        concat_ws("_", lit("ifixit"), coalesce(guide_id, source_id, lit("unknown"))).alias("review_id"),
+        coalesce(device_name, title, guide_id).alias("product_name"),
+        coalesce(device_category, lit("repairability")).alias("product_category"),
         lit("ifixit").alias("source"),
         _scale_column("repairability_score", 1.0, 10.0).alias("rating_normalized"),
-        coalesce(col("review_text"), col("text"), lit("")).alias("review_text"),
-        to_timestamp(col("published_date")).alias("review_date"),
-        coalesce(col("author"), lit("unknown")).alias("reviewer_id"),
+        coalesce(review_text, text, lit("")).alias("review_text"),
+        coalesce(
+            to_timestamp(published_date),
+            to_timestamp(created_date),
+            to_timestamp(from_unixtime(published_date.cast("bigint"))),
+            to_timestamp(from_unixtime(created_date.cast("bigint"))),
+        ).alias("review_date"),
+        coalesce(author, lit("unknown")).alias("reviewer_id"),
         lit(None).cast("boolean").alias("verified_purchase"),
-        col("helpful_votes").cast("int").alias("helpful_votes"),
+        helpful_votes.cast("int").alias("helpful_votes"),
         when(
-            col("url").isNotNull() & (trim(col("url")) != ""),
-            col("url"),
-        ).otherwise(concat_ws("", lit("https://www.ifixit.com/Guide/"), coalesce(col("guide_id"), lit("unknown")))).alias("source_url"),
-        coalesce(col("title"), col("device_name"), col("guide_id")).alias("display_name"),
-        coalesce(col("device_category"), lit("Repair Guide")).alias("display_category"),
+            url.isNotNull() & (trim(url) != ""),
+            url,
+        ).otherwise(concat_ws("", lit("https://www.ifixit.com/Guide/"), coalesce(guide_id, lit("unknown")))).alias("source_url"),
+        coalesce(title, device_name, guide_id).alias("display_name"),
+        coalesce(device_category, lit("Repair Guide")).alias("display_category"),
         lit("repair_review").alias("entity_type"),
     )
     return ifixit_df, path

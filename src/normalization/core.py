@@ -310,7 +310,12 @@ def normalize_ifixit(raw: Mapping[str, Any]) -> dict[str, Any]:
         source="ifixit",
         rating_normalized=normalize_unit_scale(raw.get("repairability_score"), 1.0, 10.0),
         review_text=str(raw.get("review_text") or raw.get("text") or ""),
-        review_date=isoformat_from_datetime_string(raw.get("published_date")),
+        review_date=(
+            isoformat_from_datetime_string(raw.get("published_date"))
+            or isoformat_from_datetime_string(raw.get("created_date"))
+            or isoformat_from_unix_seconds(raw.get("published_date"))
+            or isoformat_from_unix_seconds(raw.get("created_date"))
+        ),
         reviewer_id=str(raw.get("author") or "unknown"),
         verified_purchase=None,
         helpful_votes=_coerce_int(raw.get("helpful_votes")),
@@ -406,6 +411,37 @@ def find_first_existing_path(base_dir: Path, candidates: Sequence[str]) -> Optio
         path = (base_dir / candidate).resolve()
         if path.exists():
             return path
+    return None
+
+
+def _download_current_source_file(
+    base_dir: Path,
+    source: str,
+    candidates: Sequence[str],
+) -> Optional[Path]:
+    settings = get_settings()
+    if not settings.s3_enabled:
+        return None
+
+    try:
+        storage_manager = S3StorageManager.from_settings(settings)
+    except Exception:
+        return None
+
+    current_prefix = storage_manager.resolver.raw_current_prefix(source)
+    attempted_filenames: set[str] = set()
+    for candidate in candidates:
+        destination_path = (base_dir / candidate).resolve()
+        filename = destination_path.name
+        if not filename or filename in attempted_filenames:
+            continue
+        attempted_filenames.add(filename)
+
+        source_uri = current_prefix + filename
+        try:
+            return storage_manager.download_file(source_uri, destination_path)
+        except Exception:
+            continue
     return None
 
 
@@ -578,7 +614,12 @@ def resolve_source_input_path(base_dir: Path, source: str, candidates: Sequence[
     if source == "yelp":
         review_path, _ = resolve_yelp_source_paths(base_dir)
         return review_path
-    return find_first_existing_path(base_dir, candidates)
+    local_path = find_first_existing_path(base_dir, candidates)
+    if local_path is not None:
+        return local_path
+    if source in {"ebay", "ifixit"}:
+        return _download_current_source_file(base_dir, source, candidates)
+    return None
 
 
 def _write_jsonl(path: Path, records: Sequence[Mapping[str, Any]]) -> None:
@@ -780,7 +821,7 @@ def run_local_normalization(
             status="success",
         )
 
-    ebay_path = find_first_existing_path(settings.data_dir, EBAY_FILE_CANDIDATES)
+    ebay_path = resolve_source_input_path(settings.data_dir, "ebay", EBAY_FILE_CANDIDATES)
     if ebay_path:
         source_started_at = time.perf_counter()
         log_event(
@@ -812,7 +853,7 @@ def run_local_normalization(
             status="success",
         )
 
-    ifixit_path = find_first_existing_path(settings.data_dir, IFIXIT_FILE_CANDIDATES)
+    ifixit_path = resolve_source_input_path(settings.data_dir, "ifixit", IFIXIT_FILE_CANDIDATES)
     if ifixit_path:
         source_started_at = time.perf_counter()
         log_event(
