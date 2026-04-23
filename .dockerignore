@@ -1,0 +1,14 @@
+.git
+.github
+.venv
+.runtime
+.airflow
+.airflow-docker
+docker/airflow/.env.deploy
+data
+results
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.log
