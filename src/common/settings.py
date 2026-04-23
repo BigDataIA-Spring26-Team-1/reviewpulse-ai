@@ -52,6 +52,13 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+def _bool_env(name: str, default: bool) -> bool:
+    raw_value = os.getenv(name, "").strip().lower()
+    if not raw_value:
+        return default
+    return raw_value in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     project_root: Path
@@ -71,6 +78,10 @@ class Settings:
     s3_processed_prefix: str
     spark_master: str
     spark_sql_session_timezone: str
+    sentiment_model: str
+    ollama_host: str
+    ollama_model: str
+    ollama_timeout_seconds: int
     huggingface_token: str
     amazon_dataset_name: str
     amazon_category: str
@@ -84,11 +95,16 @@ class Settings:
     ebay_site_id: str
     ebay_marketplace_id: str
     ebay_search_queries: tuple[str, ...]
+    ebay_category_ids: tuple[str, ...]
+    ebay_crawl_all_categories: bool
     ebay_max_items_per_query: int
     ifixit_base_url: str
     ifixit_guide_ids: tuple[str, ...]
+    ifixit_max_guides: int
     youtube_api_key: str
     youtube_video_ids: tuple[str, ...]
+    youtube_search_queries: tuple[str, ...]
+    youtube_max_videos_per_query: int
     youtube_transcript_languages: tuple[str, ...]
 
     @property
@@ -151,6 +167,13 @@ def get_settings() -> Settings:
         s3_processed_prefix=os.getenv("S3_PROCESSED_PREFIX", "processed"),
         spark_master=os.getenv("SPARK_MASTER", "local[*]"),
         spark_sql_session_timezone=os.getenv("SPARK_SQL_SESSION_TIMEZONE", "UTC"),
+        sentiment_model=os.getenv(
+            "SENTIMENT_MODEL",
+            "distilbert-base-uncased-finetuned-sst-2-english",
+        ).strip(),
+        ollama_host=os.getenv("OLLAMA_HOST", "http://localhost:11434").strip(),
+        ollama_model=os.getenv("OLLAMA_MODEL", "llama3.1:8b").strip(),
+        ollama_timeout_seconds=_int_env("OLLAMA_TIMEOUT_SECONDS", 30),
         huggingface_token=os.getenv("HUGGINGFACE_TOKEN", "").strip(),
         amazon_dataset_name=os.getenv("AMAZON_DATASET_NAME", "McAuley-Lab/Amazon-Reviews-2023").strip(),
         amazon_category=os.getenv("AMAZON_CATEGORY", "Electronics").strip(),
@@ -164,10 +187,15 @@ def get_settings() -> Settings:
         ebay_site_id=os.getenv("EBAY_SITE_ID", "0").strip(),
         ebay_marketplace_id=os.getenv("EBAY_MARKETPLACE_ID", "EBAY_US").strip(),
         ebay_search_queries=_csv_env("EBAY_SEARCH_QUERIES"),
+        ebay_category_ids=_csv_env("EBAY_CATEGORY_IDS"),
+        ebay_crawl_all_categories=_bool_env("EBAY_CRAWL_ALL_CATEGORIES", False),
         ebay_max_items_per_query=_int_env("EBAY_MAX_ITEMS_PER_QUERY", 50),
         ifixit_base_url=os.getenv("IFIXIT_BASE_URL", "https://www.ifixit.com").strip(),
         ifixit_guide_ids=_csv_env("IFIXIT_GUIDE_IDS"),
+        ifixit_max_guides=_int_env("IFIXIT_MAX_GUIDES", 0),
         youtube_api_key=os.getenv("YOUTUBE_API_KEY", "").strip(),
         youtube_video_ids=_csv_env("YOUTUBE_VIDEO_IDS"),
+        youtube_search_queries=_csv_env("YOUTUBE_SEARCH_QUERIES"),
+        youtube_max_videos_per_query=_int_env("YOUTUBE_MAX_VIDEOS_PER_QUERY", 10),
         youtube_transcript_languages=_csv_env("YOUTUBE_TRANSCRIPT_LANGUAGES") or ("en",),
     )

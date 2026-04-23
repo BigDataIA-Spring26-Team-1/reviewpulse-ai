@@ -70,6 +70,11 @@ def main() -> None:
             print(f"  Source: {metadata.get('source', '')}")
             print(f"  Product: {metadata.get('product_name', '')}")
             print(f"  Category: {metadata.get('product_category', '')}")
+            if metadata.get("aspect_labels"):
+                print(
+                    f"  Aspects: {metadata.get('aspect_labels', '')} "
+                    f"({int(metadata.get('aspect_count', 0) or 0)})"
+                )
             print(
                 f"  Sentiment: {metadata.get('sentiment_label', '')} "
                 f"({metadata.get('sentiment_score', '')})"

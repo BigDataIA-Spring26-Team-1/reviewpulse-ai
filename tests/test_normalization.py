@@ -177,6 +177,33 @@ class TestAmazonNormalization:
             ("cast", "string"),
         ]
 
+    def test_resolve_spark_local_dir_prefers_configured_directory(self, tmp_path: Path):
+        configured_dir = (tmp_path / "spark-local").resolve()
+
+        resolved = spark_normalization._resolve_spark_local_dir(str(configured_dir))
+
+        assert resolved == configured_dir
+        assert configured_dir.exists()
+
+    def test_resolve_spark_local_dir_falls_back_to_runtime_directory(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ):
+        configured_dir = (tmp_path / "blocked").resolve()
+        fallback_dir = (tmp_path / ".runtime" / "spark-local").resolve()
+
+        monkeypatch.setattr(spark_normalization, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(
+            spark_normalization,
+            "_is_writable_directory",
+            lambda path: path == fallback_dir,
+        )
+
+        resolved = spark_normalization._resolve_spark_local_dir(str(configured_dir))
+
+        assert resolved == fallback_dir
+
     def test_write_parquet_via_arrow_writes_partition_files(self):
         workspace = Path(__file__).resolve().parent / "_tmp_normalization" / "arrow_parquet_writer"
         shutil.rmtree(workspace, ignore_errors=True)
@@ -467,6 +494,16 @@ class TestIFixitNormalization:
             }
         )
         assert result["rating_normalized"] == 1.0
+
+    def test_unix_seconds_published_date_is_converted_to_iso(self):
+        result = normalize_ifixit(
+            {
+                "guide_id": "ifixit_142085",
+                "published_date": 1704067200,
+                "review_text": "Very easy to repair.",
+            }
+        )
+        assert result["review_date"] == "2024-01-01T00:00:00+00:00"
 
 
 class TestRedditNormalization:
