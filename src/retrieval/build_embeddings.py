@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+import pyarrow.dataset as ds
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
@@ -26,11 +27,37 @@ from src.common.storage import S3StorageManager
 from src.common.structured_logging import configure_structured_logging, get_logger, log_event
 from src.common.run_context import build_run_context
 from src.common.spark_runtime import ensure_local_hadoop_home
+from src.retrieval.embedding_backend import (
+    encode_texts,
+    load_embedding_backend,
+    write_embedding_backend_metadata,
+)
 
 
 DEPENDENCY_SETUP_HINT = (
     "Install project dependencies with `poetry install` and use the Poetry environment "
     "before running the embeddings pipeline."
+)
+
+EMBEDDING_COLUMNS = (
+    "review_id",
+    "review_text",
+    "source",
+    "product_name",
+    "product_category",
+    "display_name",
+    "display_category",
+    "entity_type",
+    "sentiment_label",
+    "sentiment_score",
+    "review_date",
+    "source_url",
+)
+
+WINDOWS_NATIVE_PARQUET_ERROR_MARKERS = (
+    "NativeIO$Windows.access0",
+    "UnsatisfiedLinkError",
+    "Access denied",
 )
 
 
@@ -43,17 +70,6 @@ def _require_pyspark():
             "Missing dependency: `pyspark`. " + DEPENDENCY_SETUP_HINT
         ) from exc
     return SparkSession
-
-
-def _require_sentence_transformer():
-    try:
-        sentence_transformers = importlib.import_module("sentence_transformers")
-        SentenceTransformer = sentence_transformers.SentenceTransformer
-    except ImportError as exc:
-        raise RuntimeError(
-            "Missing dependency: `sentence-transformers`. " + DEPENDENCY_SETUP_HINT
-        ) from exc
-    return SentenceTransformer
 
 
 def _require_chromadb():
@@ -79,6 +95,35 @@ def build_spark() -> Any:
     if hadoop_home is not None:
         builder = builder.config("spark.hadoop.hadoop.home.dir", str(hadoop_home))
     return builder.getOrCreate()
+
+
+def _is_windows_native_parquet_error(exc: BaseException) -> bool:
+    if os.name != "nt":
+        return False
+
+    current: BaseException | None = exc
+    while current is not None:
+        message = f"{type(current).__name__}: {current}"
+        if "NativeIO$Windows.access0" in message and "Access denied" in message:
+            return True
+        if all(marker in message for marker in WINDOWS_NATIVE_PARQUET_ERROR_MARKERS[:2]):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _prepare_embedding_dataframe(df: Any) -> Any:
+    return df.filter("review_text IS NOT NULL").select(*EMBEDDING_COLUMNS)
+
+
+def _load_embedding_rows_with_arrow(input_path: Path) -> list[dict[str, object]]:
+    dataset = ds.dataset(str(input_path), format="parquet")
+    available_columns = [column for column in EMBEDDING_COLUMNS if column in dataset.schema.names]
+    rows: list[dict[str, object]] = []
+    for batch in dataset.to_batches(columns=available_columns):
+        for row in batch.to_pylist():
+            rows.append({column: row.get(column) for column in EMBEDDING_COLUMNS})
+    return rows
 
 
 def main() -> None:
@@ -115,37 +160,34 @@ def main() -> None:
         )
         raise RuntimeError("Sentiment parquet not found. Run sentiment scoring first.")
 
-    spark = build_spark()
-    df = spark.read.parquet(str(settings.sentiment_parquet_path))
-    df = df.filter(df.review_text.isNotNull())
-
-    amazon_df = df.filter(df.source == "amazon").limit(2000)
-    yelp_df = df.filter(df.source == "yelp").limit(2000)
-    ebay_df = df.filter(df.source == "ebay").limit(1000)
-    ifixit_df = df.filter(df.source == "ifixit").limit(1000)
-    youtube_df = df.filter(df.source == "youtube").limit(250)
-    reddit_df = df.filter(df.source == "reddit").limit(500)
-
-    df = amazon_df.unionByName(yelp_df)
-    for source_df in [ebay_df, ifixit_df, youtube_df, reddit_df]:
-        df = df.unionByName(source_df)
-
-    rows = df.select(
-        "review_id",
-        "review_text",
-        "source",
-        "product_name",
-        "product_category",
-        "display_name",
-        "display_category",
-        "entity_type",
-        "sentiment_label",
-        "sentiment_score",
-        "review_date",
-        "source_url",
-    ).collect()
-
-    spark.stop()
+    spark = None
+    try:
+        spark = build_spark()
+        df = spark.read.parquet(str(settings.sentiment_parquet_path))
+        rows = _prepare_embedding_dataframe(df).collect()
+    except Exception as exc:
+        if spark is not None:
+            spark.stop()
+            spark = None
+        if not _is_windows_native_parquet_error(exc):
+            raise
+        log_event(
+            logger,
+            "parquet_read_fallback",
+            level=logging.WARNING,
+            stage=run_context.stage,
+            run_id=run_context.run_id,
+            dag_id=run_context.dag_id,
+            task_id=run_context.task_id,
+            input_path=str(settings.sentiment_parquet_path),
+            status="fallback",
+            error_type=type(exc).__name__,
+            error_message="Spark parquet read failed on Windows; falling back to pyarrow.",
+        )
+        rows = _load_embedding_rows_with_arrow(settings.sentiment_parquet_path)
+    finally:
+        if spark is not None:
+            spark.stop()
 
     if not rows:
         log_event(
@@ -189,8 +231,21 @@ def main() -> None:
         )
 
     model_name = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-    SentenceTransformer = _require_sentence_transformer()
-    model = SentenceTransformer(model_name)
+    backend = load_embedding_backend(model_name=model_name)
+    if backend.fallback_reason:
+        log_event(
+            logger,
+            "embedding_backend_fallback",
+            level=logging.WARNING,
+            stage=run_context.stage,
+            run_id=run_context.run_id,
+            dag_id=run_context.dag_id,
+            task_id=run_context.task_id,
+            status="fallback",
+            error_type="EmbeddingBackendFallback",
+            error_message=backend.fallback_reason,
+            output_path=backend.model_name,
+        )
 
     log_event(
         logger,
@@ -200,12 +255,15 @@ def main() -> None:
         dag_id=run_context.dag_id,
         task_id=run_context.task_id,
         record_count=len(documents),
+        entity_type=backend.backend_name,
+        output_path=backend.model_name,
         status="started",
     )
-    embeddings = model.encode(documents, batch_size=64, show_progress_bar=True)
+    embeddings = encode_texts(backend, documents, batch_size=64, show_progress_bar=True)
 
     if settings.chroma_path.exists():
         shutil.rmtree(settings.chroma_path)
+    write_embedding_backend_metadata(settings.chroma_path, backend)
 
     chromadb = _require_chromadb()
     client = chromadb.PersistentClient(path=str(settings.chroma_path))
@@ -218,7 +276,7 @@ def main() -> None:
         collection.add(
             ids=ids[index:index + batch_size],
             documents=documents[index:index + batch_size],
-            embeddings=embeddings[index:index + batch_size].tolist(),
+            embeddings=embeddings[index:index + batch_size],
             metadatas=metadatas[index:index + batch_size],
         )
     run_prefix = storage_manager.resolver.processed_run_prefix("chromadb", run_context.run_id)

@@ -6,6 +6,7 @@ import json
 import logging
 import shutil
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -21,6 +22,7 @@ from src.normalization.core import (
     EBAY_FILE_CANDIDATES,
     IFIXIT_FILE_CANDIDATES,
     UNIFIED_REVIEW_FIELDS,
+    _upload_raw_snapshot,
     create_unified_record,
     normalize_amazon,
     normalize_ebay,
@@ -28,10 +30,12 @@ from src.normalization.core import (
     normalize_reddit,
     normalize_yelp,
     normalize_youtube,
+    resolve_normalization_sources,
     resolve_amazon_source_path,
     resolve_source_input_path,
     resolve_yelp_source_paths,
 )
+from src.common.run_context import build_run_context
 from src.common.storage import S3PathResolver, S3StorageManager
 import src.spark.normalize_reviews_spark as spark_normalization
 from tests.test_storage_foundation import FakeS3Client
@@ -502,6 +506,93 @@ class TestEbayNormalization:
 
             assert resolved == (workspace / expected_relative_path).resolve()
             assert resolved.read_text(encoding="utf-8") == '{"id":"1"}\n'
+        finally:
+            shutil.rmtree(workspace, ignore_errors=True)
+
+
+class TestRawSnapshotUploads:
+    def test_upload_raw_snapshot_uploads_directory_contents(self):
+        workspace = Path(__file__).resolve().parent / "_tmp_normalization" / "raw_snapshot_directory"
+        shutil.rmtree(workspace, ignore_errors=True)
+        try:
+            source_dir = workspace / "amazon" / "runs" / "run_123"
+            source_dir.mkdir(parents=True, exist_ok=True)
+            batch_path = source_dir / "amazon_reviews_batch_000001.jsonl"
+            manifest_path = source_dir / "manifest.json"
+            batch_path.write_text('{"review_id":"1"}\n', encoding="utf-8")
+            manifest_path.write_text('{"record_count":1}\n', encoding="utf-8")
+
+            client = FakeS3Client()
+            storage_manager = S3StorageManager(
+                S3PathResolver(bucket="reviewpulse-bucket", raw_prefix="raw", processed_prefix="processed"),
+                client,
+            )
+            run_context = build_run_context(
+                stage="normalize_local_preview",
+                source="amazon",
+                run_id="run_normalize_123",
+            )
+
+            destination_uri = _upload_raw_snapshot(
+                storage_manager,
+                logging.getLogger("reviewpulse.tests.normalization"),
+                run_context,
+                "amazon",
+                source_dir,
+            )
+
+            assert destination_uri == "s3://reviewpulse-bucket/raw/amazon/runs/run_normalize_123/"
+            assert (
+                "reviewpulse-bucket",
+                "raw/amazon/runs/run_normalize_123/amazon_reviews_batch_000001.jsonl",
+            ) in client.objects
+            assert (
+                "reviewpulse-bucket",
+                "raw/amazon/runs/run_normalize_123/manifest.json",
+            ) in client.objects
+        finally:
+            shutil.rmtree(workspace, ignore_errors=True)
+
+
+class TestNormalizationSourceSelection:
+    def test_resolve_normalization_sources_defaults_to_all_supported_sources(self):
+        from tests.test_source_ingestion import build_test_settings
+
+        workspace = Path(__file__).resolve().parent / "_tmp_normalization" / "normalization_sources_default"
+        shutil.rmtree(workspace, ignore_errors=True)
+        try:
+            settings = build_test_settings(workspace)
+            assert resolve_normalization_sources(settings) == (
+                "amazon",
+                "yelp",
+                "ebay",
+                "ifixit",
+                "youtube",
+                "reddit",
+            )
+        finally:
+            shutil.rmtree(workspace, ignore_errors=True)
+
+    def test_resolve_normalization_sources_accepts_ebay_only(self):
+        from tests.test_source_ingestion import build_test_settings
+
+        workspace = Path(__file__).resolve().parent / "_tmp_normalization" / "normalization_sources_ebay"
+        shutil.rmtree(workspace, ignore_errors=True)
+        try:
+            settings = replace(build_test_settings(workspace), normalization_sources=("ebay",))
+            assert resolve_normalization_sources(settings) == ("ebay",)
+        finally:
+            shutil.rmtree(workspace, ignore_errors=True)
+
+    def test_spark_build_loaders_respects_normalization_sources(self):
+        from tests.test_source_ingestion import build_test_settings
+
+        workspace = Path(__file__).resolve().parent / "_tmp_normalization" / "spark_normalization_sources"
+        shutil.rmtree(workspace, ignore_errors=True)
+        try:
+            settings = replace(build_test_settings(workspace), normalization_sources=("ebay",))
+            loaders = spark_normalization._build_loaders(settings)
+            assert [loader.__name__ for loader in loaders] == ["normalize_ebay"]
         finally:
             shutil.rmtree(workspace, ignore_errors=True)
 

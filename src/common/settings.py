@@ -72,6 +72,7 @@ class Settings:
     normalized_parquet_path: Path
     sentiment_parquet_path: Path
     chroma_path: Path
+    normalization_sources: tuple[str, ...]
     aws_region: str
     s3_bucket_name: str
     s3_raw_prefix: str
@@ -166,6 +167,7 @@ def get_settings() -> Settings:
         normalized_parquet_path=normalized_parquet_path,
         sentiment_parquet_path=sentiment_parquet_path,
         chroma_path=chroma_path,
+        normalization_sources=_csv_env("NORMALIZATION_SOURCES"),
         aws_region=os.getenv("AWS_REGION", "us-east-1"),
         s3_bucket_name=os.getenv("S3_BUCKET_NAME", "").strip(),
         s3_raw_prefix=os.getenv("S3_RAW_PREFIX", "raw"),

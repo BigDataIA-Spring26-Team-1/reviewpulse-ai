@@ -17,7 +17,6 @@ import chromadb
 from fastapi import FastAPI, Query
 from pydantic import BaseModel
 from pyspark.sql import SparkSession
-from sentence_transformers import SentenceTransformer
 
 try:
     from dotenv import load_dotenv
@@ -37,6 +36,7 @@ from src.insights import (
     build_quality_metrics,
     build_source_comparison,
 )
+from src.retrieval.embedding_backend import EmbeddingBackend, encode_texts, load_embedding_backend
 
 
 try:
@@ -99,8 +99,8 @@ def get_spark() -> SparkSession:
     )
 
 
-def get_model() -> SentenceTransformer:
-    return SentenceTransformer(EMBEDDING_MODEL)
+def get_model() -> EmbeddingBackend:
+    return load_embedding_backend(chroma_path=settings.chroma_path, model_name=EMBEDDING_MODEL)
 
 
 def get_collection():
@@ -213,7 +213,7 @@ def retrieve_reviews(query: str, source_filter: Optional[str] = None, n_results:
 
     model = get_model()
     collection = get_collection()
-    query_embedding = model.encode([query])[0].tolist()
+    query_embedding = encode_texts(model, [query])[0]
 
     where = {"source": source_filter.lower()} if source_filter else None
     results = collection.query(

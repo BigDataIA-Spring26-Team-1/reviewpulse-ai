@@ -8,11 +8,15 @@ Run:
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import sys
 import time
 from pathlib import Path
 
+import pyarrow as pa
+import pyarrow.dataset as ds
+import pyarrow.parquet as pq
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, udf
 from pyspark.sql.types import DoubleType, StringType, StructField, StructType
@@ -68,6 +72,12 @@ NEGATIVE_WORDS = {
     "return",
 }
 
+WINDOWS_NATIVE_PARQUET_ERROR_MARKERS = (
+    "NativeIO$Windows.access0",
+    "UnsatisfiedLinkError",
+    "Access denied",
+)
+
 
 def build_spark() -> SparkSession:
     settings = get_settings()
@@ -81,6 +91,52 @@ def build_spark() -> SparkSession:
     if hadoop_home is not None:
         builder = builder.config("spark.hadoop.hadoop.home.dir", str(hadoop_home))
     return builder.getOrCreate()
+
+
+def _is_windows_native_parquet_error(exc: BaseException) -> bool:
+    if os.name != "nt":
+        return False
+
+    current: BaseException | None = exc
+    while current is not None:
+        message = f"{type(current).__name__}: {current}"
+        if "NativeIO$Windows.access0" in message and "Access denied" in message:
+            return True
+        if all(marker in message for marker in WINDOWS_NATIVE_PARQUET_ERROR_MARKERS[:2]):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _score_sentiment_with_arrow(input_path: Path, output_path: Path) -> int:
+    dataset = ds.dataset(str(input_path), format="parquet")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.rmtree(output_path, ignore_errors=True)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    total_records = 0
+    wrote_any_batches = False
+    for part_index, batch in enumerate(dataset.to_batches()):
+        wrote_any_batches = True
+        table = pa.Table.from_batches([batch])
+        sentiments = [score_sentiment(text) for text in table.column("review_text").to_pylist()]
+        labels = pa.array([label for label, _score in sentiments], type=pa.string())
+        scores = pa.array([score for _label, score in sentiments], type=pa.float64())
+        table = table.append_column("sentiment_label", labels)
+        table = table.append_column("sentiment_score", scores)
+        pq.write_table(table, output_path / f"part-{part_index:05d}.parquet", compression="snappy")
+        total_records += table.num_rows
+
+    if not wrote_any_batches:
+        empty_table = pa.Table.from_arrays(
+            [pa.array([], type=field.type) for field in dataset.schema],
+            names=dataset.schema.names,
+        )
+        empty_table = empty_table.append_column("sentiment_label", pa.array([], type=pa.string()))
+        empty_table = empty_table.append_column("sentiment_score", pa.array([], type=pa.float64()))
+        pq.write_table(empty_table, output_path / "part-00000.parquet", compression="snappy")
+
+    return total_records
 
 
 def score_sentiment(text: str) -> tuple[str, float]:
@@ -123,7 +179,6 @@ def main() -> None:
     run_context = build_run_context(stage="sentiment_scoring")
     started_at = time.perf_counter()
     storage_manager = S3StorageManager.from_settings(settings)
-    spark = build_spark()
 
     log_event(
         logger,
@@ -136,7 +191,6 @@ def main() -> None:
     )
 
     if not settings.normalized_parquet_path.exists():
-        spark.stop()
         log_event(
             logger,
             "sentiment_scoring_failed",
@@ -152,8 +206,6 @@ def main() -> None:
         )
         raise RuntimeError("Normalized parquet not found. Run the Spark normalization pipeline first.")
 
-    df = spark.read.parquet(str(settings.normalized_parquet_path))
-
     log_event(
         logger,
         "sentiment_scoring_started",
@@ -164,20 +216,51 @@ def main() -> None:
         input_path=str(settings.normalized_parquet_path),
         status="started",
     )
-    enriched = df.withColumn("sentiment_struct", sentiment_udf(col("review_text")))
-    enriched = (
-        enriched
-        .withColumn("sentiment_label", col("sentiment_struct.sentiment_label"))
-        .withColumn("sentiment_score", col("sentiment_struct.sentiment_score"))
-        .drop("sentiment_struct")
-    )
-    enriched_count = enriched.count()
+    spark: SparkSession | None = None
+    try:
+        spark = build_spark()
+        df = spark.read.parquet(str(settings.normalized_parquet_path))
+        enriched = df.withColumn("sentiment_struct", sentiment_udf(col("review_text")))
+        enriched = (
+            enriched
+            .withColumn("sentiment_label", col("sentiment_struct.sentiment_label"))
+            .withColumn("sentiment_score", col("sentiment_struct.sentiment_score"))
+            .drop("sentiment_struct")
+        )
+        enriched_count = enriched.count()
 
-    if settings.sentiment_parquet_path.exists():
-        shutil.rmtree(settings.sentiment_parquet_path)
+        if settings.sentiment_parquet_path.exists():
+            shutil.rmtree(settings.sentiment_parquet_path)
 
-    settings.sentiment_parquet_path.parent.mkdir(parents=True, exist_ok=True)
-    enriched.write.mode("overwrite").parquet(str(settings.sentiment_parquet_path))
+        settings.sentiment_parquet_path.parent.mkdir(parents=True, exist_ok=True)
+        enriched.write.mode("overwrite").parquet(str(settings.sentiment_parquet_path))
+    except Exception as exc:
+        if spark is not None:
+            spark.stop()
+            spark = None
+        if not _is_windows_native_parquet_error(exc):
+            raise
+        log_event(
+            logger,
+            "parquet_read_fallback",
+            level=logging.WARNING,
+            stage=run_context.stage,
+            run_id=run_context.run_id,
+            dag_id=run_context.dag_id,
+            task_id=run_context.task_id,
+            input_path=str(settings.normalized_parquet_path),
+            output_path=str(settings.sentiment_parquet_path),
+            status="fallback",
+            error_type=type(exc).__name__,
+            error_message="Spark parquet read failed on Windows; falling back to pyarrow.",
+        )
+        enriched_count = _score_sentiment_with_arrow(
+            settings.normalized_parquet_path,
+            settings.sentiment_parquet_path,
+        )
+    finally:
+        if spark is not None:
+            spark.stop()
     run_prefix = storage_manager.resolver.processed_run_prefix("sentiment_parquet", run_context.run_id)
     current_prefix = storage_manager.resolver.processed_current_prefix("sentiment_parquet")
 
@@ -223,7 +306,6 @@ def main() -> None:
         status="success",
     )
 
-    spark.stop()
     log_event(
         logger,
         "sentiment_scoring_completed",

@@ -65,6 +65,7 @@ def build_test_settings(workspace: Path) -> Settings:
         normalized_parquet_path=data_dir / "normalized_reviews_parquet",
         sentiment_parquet_path=data_dir / "reviews_with_sentiment_parquet",
         chroma_path=data_dir / "chromadb_reviews",
+        normalization_sources=tuple(),
         aws_region="us-east-1",
         s3_bucket_name="reviewpulse-bucket",
         s3_raw_prefix="raw",

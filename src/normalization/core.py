@@ -18,6 +18,7 @@ from src.common.structured_logging import configure_structured_logging, get_logg
 
 PROPOSAL_CORE_SOURCES = ("amazon", "yelp", "ebay", "ifixit", "youtube")
 OPTIONAL_SOURCES = ("reddit",)
+SUPPORTED_NORMALIZATION_SOURCES = PROPOSAL_CORE_SOURCES + OPTIONAL_SOURCES
 
 AMAZON_FILE_CANDIDATES = (
     "amazon/current",
@@ -635,6 +636,37 @@ def _average(values: Sequence[float]) -> float:
     return sum(values) / len(values)
 
 
+def resolve_normalization_sources(
+    settings: Any,
+    *,
+    include_optional_sources: bool = True,
+) -> tuple[str, ...]:
+    configured_sources = tuple(
+        str(value).strip().lower()
+        for value in getattr(settings, "normalization_sources", ())
+        if str(value).strip()
+    )
+    allowed_sources = SUPPORTED_NORMALIZATION_SOURCES if include_optional_sources else PROPOSAL_CORE_SOURCES
+
+    if not configured_sources:
+        return allowed_sources
+
+    invalid_sources = tuple(source for source in configured_sources if source not in allowed_sources)
+    if invalid_sources:
+        allowed_display = ", ".join(sorted(allowed_sources))
+        invalid_display = ", ".join(invalid_sources)
+        raise ValueError(
+            "NORMALIZATION_SOURCES contains unsupported values: "
+            f"{invalid_display}. Allowed values: {allowed_display}."
+        )
+
+    deduped_sources: list[str] = []
+    for source in configured_sources:
+        if source not in deduped_sources:
+            deduped_sources.append(source)
+    return tuple(deduped_sources)
+
+
 def _upload_raw_snapshot(
     storage_manager: S3StorageManager,
     logger: logging.Logger,
@@ -642,7 +674,8 @@ def _upload_raw_snapshot(
     source_name: str,
     source_path: Path,
 ) -> str:
-    destination_uri = storage_manager.resolver.raw_run_prefix(source_name, run_context.run_id) + source_path.name
+    run_prefix = storage_manager.resolver.raw_run_prefix(source_name, run_context.run_id)
+    destination_uri = run_prefix if source_path.is_dir() else run_prefix + source_path.name
     log_event(
         logger,
         "s3_upload_started",
@@ -655,7 +688,11 @@ def _upload_raw_snapshot(
         output_path=destination_uri,
         status="started",
     )
-    storage_manager.upload_file(source_path, destination_uri)
+    if source_path.is_dir():
+        file_count = len(storage_manager.upload_directory(source_path, destination_uri))
+    else:
+        storage_manager.upload_file(source_path, destination_uri)
+        file_count = 1
     log_event(
         logger,
         "s3_upload_completed",
@@ -666,7 +703,7 @@ def _upload_raw_snapshot(
         task_id=run_context.task_id,
         input_path=str(source_path),
         output_path=destination_uri,
-        file_count=1,
+        file_count=file_count,
         status="success",
     )
     return destination_uri
@@ -742,6 +779,7 @@ def run_local_normalization(
     source_counts: dict[str, int] = {}
     available_sources: list[tuple[str, Path]] = []
     raw_sources_for_promotion: list[str] = []
+    selected_sources = set(resolve_normalization_sources(settings, include_optional_sources=include_optional_sources))
 
     log_event(
         logger,
@@ -754,7 +792,7 @@ def run_local_normalization(
     )
 
     amazon_path = resolve_source_input_path(settings.data_dir, "amazon", AMAZON_FILE_CANDIDATES)
-    if amazon_path:
+    if "amazon" in selected_sources and amazon_path:
         source_started_at = time.perf_counter()
         log_event(
             logger,
@@ -786,7 +824,7 @@ def run_local_normalization(
         )
 
     yelp_review_path, yelp_business_path = resolve_yelp_source_paths(settings.data_dir)
-    if yelp_review_path:
+    if "yelp" in selected_sources and yelp_review_path:
         source_started_at = time.perf_counter()
         log_event(
             logger,
@@ -822,7 +860,7 @@ def run_local_normalization(
         )
 
     ebay_path = resolve_source_input_path(settings.data_dir, "ebay", EBAY_FILE_CANDIDATES)
-    if ebay_path:
+    if "ebay" in selected_sources and ebay_path:
         source_started_at = time.perf_counter()
         log_event(
             logger,
@@ -854,7 +892,7 @@ def run_local_normalization(
         )
 
     ifixit_path = resolve_source_input_path(settings.data_dir, "ifixit", IFIXIT_FILE_CANDIDATES)
-    if ifixit_path:
+    if "ifixit" in selected_sources and ifixit_path:
         source_started_at = time.perf_counter()
         log_event(
             logger,
@@ -886,7 +924,7 @@ def run_local_normalization(
         )
 
     youtube_path = find_first_existing_path(settings.data_dir, YOUTUBE_FILE_CANDIDATES)
-    if youtube_path:
+    if "youtube" in selected_sources and youtube_path:
         source_started_at = time.perf_counter()
         log_event(
             logger,
@@ -917,7 +955,7 @@ def run_local_normalization(
             status="success",
         )
 
-    if include_optional_sources:
+    if include_optional_sources and "reddit" in selected_sources:
         reddit_path = find_first_existing_path(settings.data_dir, REDDIT_FILE_CANDIDATES)
         if reddit_path:
             reddit_records = [normalize_reddit(row) for row in load_jsonl(reddit_path)]

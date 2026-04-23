@@ -98,6 +98,7 @@ from src.normalization.core import (
     YELP_REVIEW_FILE_CANDIDATES,
     YOUTUBE_FILE_CANDIDATES,
     find_first_existing_path,
+    resolve_normalization_sources,
     resolve_source_input_path,
     resolve_yelp_source_paths,
 )
@@ -400,6 +401,19 @@ def normalize_reddit(spark: Any) -> tuple[Any | None, Path | None]:
     return reddit_df, path
 
 
+def _build_loaders(settings: Any) -> list[Any]:
+    selected_sources = set(resolve_normalization_sources(settings, include_optional_sources=True))
+    source_loaders = [
+        ("amazon", normalize_amazon),
+        ("yelp", normalize_yelp),
+        ("ebay", normalize_ebay),
+        ("ifixit", normalize_ifixit),
+        ("youtube", normalize_youtube),
+        ("reddit", normalize_reddit),
+    ]
+    return [loader for source_name, loader in source_loaders if source_name in selected_sources]
+
+
 def add_feature_columns(df: Any) -> Any:
     text = coalesce(col("review_text"), lit(""))
     normalized_text = trim(regexp_replace(text, r"\s+", " "))
@@ -590,14 +604,7 @@ def main() -> None:
         status="started",
     )
 
-    loaders = [
-        normalize_amazon,
-        normalize_yelp,
-        normalize_ebay,
-        normalize_ifixit,
-        normalize_youtube,
-        normalize_reddit,
-    ]
+    loaders = _build_loaders(settings)
 
     dataframes: list[Any] = []
     for loader in loaders:

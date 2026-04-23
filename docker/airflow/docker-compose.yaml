@@ -11,6 +11,7 @@ services:
       AIRFLOW_HOME: /opt/airflow
       AIRFLOW__CORE__LOAD_EXAMPLES: "False"
       AIRFLOW__CORE__DAGS_FOLDER: /opt/reviewpulse/dags
+      NORMALIZATION_SOURCES: "${NORMALIZATION_SOURCES:-}"
       PYTHONPATH: /opt/reviewpulse
       REVIEWPULSE_PROJECT_PYTHON: /home/airflow/reviewpulse-venv/bin/python
     volumes:

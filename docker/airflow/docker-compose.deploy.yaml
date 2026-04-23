@@ -20,6 +20,7 @@ services:
       REVIEWPULSE_PROJECT_VENV: /opt/airflow/reviewpulse-venv
       APP_ENV: "${APP_ENV:-production}"
       LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      NORMALIZATION_SOURCES: "${NORMALIZATION_SOURCES:-}"
       DATA_DIR: /opt/reviewpulse/data
       RAW_DATA_DIR: /opt/reviewpulse/data/raw
       PROCESSED_DATA_DIR: /opt/reviewpulse/data/processed
