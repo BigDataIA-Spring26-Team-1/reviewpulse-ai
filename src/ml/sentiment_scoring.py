@@ -8,112 +8,124 @@ Run:
 from __future__ import annotations
 
 import logging
-import shutil
 import sys
 import time
 from pathlib import Path
 
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, udf
-from pyspark.sql.types import DoubleType, StringType, StructField, StructType
+import pyarrow as pa
+import pyarrow.dataset as ds
+import pyarrow.parquet as pq
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.common.run_context import build_run_context
 from src.common.settings import get_settings
 from src.common.storage import S3StorageManager
 from src.common.structured_logging import configure_structured_logging, get_logger, log_event
-from src.common.run_context import build_run_context
-from src.common.spark_runtime import ensure_local_hadoop_home
-
-
-POSITIVE_WORDS = {
-    "great",
-    "excellent",
-    "amazing",
-    "good",
-    "love",
-    "best",
-    "awesome",
-    "perfect",
-    "premium",
-    "smooth",
-    "fast",
-    "recommend",
-    "durable",
-    "comfortable",
-    "improved",
-    "incredible",
-}
-
-NEGATIVE_WORDS = {
-    "bad",
-    "terrible",
-    "awful",
-    "poor",
-    "worst",
-    "hate",
-    "broken",
-    "cheap",
-    "slow",
-    "disappointing",
-    "lag",
-    "issue",
-    "problem",
-    "expensive",
-    "overpriced",
-    "refund",
-    "return",
-}
-
-
-def build_spark() -> SparkSession:
-    settings = get_settings()
-    hadoop_home = ensure_local_hadoop_home(PROJECT_ROOT)
-    builder = (
-        SparkSession.builder
-        .appName("ReviewPulse-Sentiment")
-        .master(settings.spark_master)
-        .config("spark.sql.session.timeZone", settings.spark_sql_session_timezone)
-    )
-    if hadoop_home is not None:
-        builder = builder.config("spark.hadoop.hadoop.home.dir", str(hadoop_home))
-    return builder.getOrCreate()
-
-
-def score_sentiment(text: str) -> tuple[str, float]:
-    if not text or not text.strip():
-        return ("neutral", 0.0)
-
-    words = text.lower().split()
-    pos = sum(1 for word in words if word.strip(".,!?;:()[]'\"") in POSITIVE_WORDS)
-    neg = sum(1 for word in words if word.strip(".,!?;:()[]'\"") in NEGATIVE_WORDS)
-
-    total = pos + neg
-    if total == 0:
-        return ("neutral", 0.0)
-
-    score = (pos - neg) / total
-    if score > 0.2:
-        label = "positive"
-    elif score < -0.2:
-        label = "negative"
-    else:
-        label = "neutral"
-
-    return (label, float(round(score, 4)))
-
-
-sentiment_schema = StructType(
-    [
-        StructField("sentiment_label", StringType(), True),
-        StructField("sentiment_score", DoubleType(), True),
-    ]
+from src.ml.aspect_extraction import (
+    extract_aspects_heuristic,
+    extract_aspects_with_ollama,
+    probe_ollama_host,
+    serialize_aspects,
 )
+from src.ml.sentiment_backend import DEFAULT_SENTIMENT_MODEL, SentimentBackend, load_sentiment_backend, score_texts
 
-sentiment_udf = udf(score_sentiment, sentiment_schema)
+
+def _read_parquet_rows_with_arrow(input_path: Path) -> list[dict[str, object]]:
+    dataset = ds.dataset(str(input_path), format="parquet")
+    table = dataset.to_table()
+    return [dict(row) for row in table.to_pylist()]
+
+
+def _write_parquet_rows_with_arrow(rows: list[dict[str, object]], output_path: Path) -> None:
+    if output_path.exists():
+        import shutil
+
+        shutil.rmtree(output_path)
+
+    output_path.mkdir(parents=True, exist_ok=True)
+    table = pa.Table.from_pylist(rows)
+    pq.write_table(table, output_path / "part-00000.parquet", compression="snappy")
+
+
+def _extract_aspects_for_text(
+    text: str | None,
+    *,
+    ollama_available: bool,
+    ollama_host: str,
+    ollama_model: str,
+    ollama_timeout_seconds: int,
+) -> list[dict[str, object]]:
+    if ollama_available:
+        ollama_aspects = extract_aspects_with_ollama(
+            text,
+            ollama_host=ollama_host,
+            ollama_model=ollama_model,
+            timeout_seconds=ollama_timeout_seconds,
+        )
+        if ollama_aspects is not None:
+            return ollama_aspects
+    return extract_aspects_heuristic(text)
+
+
+def _score_sentiment_with_arrow(
+    input_path: Path,
+    output_path: Path,
+    *,
+    sentiment_backend: SentimentBackend | None = None,
+    sentiment_model_name: str | None = None,
+    ollama_available: bool | None = None,
+    ollama_host: str | None = None,
+    ollama_model: str | None = None,
+    ollama_timeout_seconds: int | None = None,
+) -> int:
+    rows = _read_parquet_rows_with_arrow(input_path)
+    if not rows:
+        _write_parquet_rows_with_arrow([], output_path)
+        return 0
+
+    backend = sentiment_backend or load_sentiment_backend(
+        sentiment_model_name or DEFAULT_SENTIMENT_MODEL
+    )
+    resolved_ollama_host = str(ollama_host or "http://localhost:11434")
+    resolved_ollama_model = str(ollama_model or "llama3.1:8b")
+    resolved_ollama_timeout = int(ollama_timeout_seconds or 30)
+    should_use_ollama = (
+        probe_ollama_host(resolved_ollama_host, resolved_ollama_timeout)
+        if ollama_available is None
+        else ollama_available
+    )
+
+    sentiment_scores = score_texts(
+        backend,
+        [str(row.get("review_text", "") or "") for row in rows],
+    )
+
+    enriched_rows: list[dict[str, object]] = []
+    for row, (sentiment_label, sentiment_score) in zip(rows, sentiment_scores):
+        review_text = str(row.get("review_text", "") or "")
+        aspects = _extract_aspects_for_text(
+            review_text,
+            ollama_available=should_use_ollama,
+            ollama_host=resolved_ollama_host,
+            ollama_model=resolved_ollama_model,
+            ollama_timeout_seconds=resolved_ollama_timeout,
+        )
+        aspect_labels, aspect_count, aspect_details_json = serialize_aspects(aspects)
+
+        enriched_row = dict(row)
+        enriched_row["aspect_labels"] = aspect_labels
+        enriched_row["aspect_count"] = int(aspect_count)
+        enriched_row["aspect_details_json"] = aspect_details_json
+        enriched_row["sentiment_label"] = sentiment_label
+        enriched_row["sentiment_score"] = float(sentiment_score)
+        enriched_rows.append(enriched_row)
+
+    _write_parquet_rows_with_arrow(enriched_rows, output_path)
+    return len(enriched_rows)
 
 
 def main() -> None:
@@ -122,8 +134,11 @@ def main() -> None:
     logger = get_logger("ml.sentiment")
     run_context = build_run_context(stage="sentiment_scoring")
     started_at = time.perf_counter()
-    storage_manager = S3StorageManager.from_settings(settings)
-    spark = build_spark()
+    storage_manager = (
+        S3StorageManager.from_settings(settings)
+        if settings.s3_enabled
+        else None
+    )
 
     log_event(
         logger,
@@ -136,7 +151,6 @@ def main() -> None:
     )
 
     if not settings.normalized_parquet_path.exists():
-        spark.stop()
         log_event(
             logger,
             "sentiment_scoring_failed",
@@ -152,7 +166,11 @@ def main() -> None:
         )
         raise RuntimeError("Normalized parquet not found. Run the Spark normalization pipeline first.")
 
-    df = spark.read.parquet(str(settings.normalized_parquet_path))
+    sentiment_backend = load_sentiment_backend(settings.sentiment_model)
+    ollama_available = probe_ollama_host(
+        settings.ollama_host,
+        settings.ollama_timeout_seconds,
+    )
 
     log_event(
         logger,
@@ -163,67 +181,68 @@ def main() -> None:
         task_id=run_context.task_id,
         input_path=str(settings.normalized_parquet_path),
         status="started",
-    )
-    enriched = df.withColumn("sentiment_struct", sentiment_udf(col("review_text")))
-    enriched = (
-        enriched
-        .withColumn("sentiment_label", col("sentiment_struct.sentiment_label"))
-        .withColumn("sentiment_score", col("sentiment_struct.sentiment_score"))
-        .drop("sentiment_struct")
-    )
-    enriched_count = enriched.count()
-
-    if settings.sentiment_parquet_path.exists():
-        shutil.rmtree(settings.sentiment_parquet_path)
-
-    settings.sentiment_parquet_path.parent.mkdir(parents=True, exist_ok=True)
-    enriched.write.mode("overwrite").parquet(str(settings.sentiment_parquet_path))
-    run_prefix = storage_manager.resolver.processed_run_prefix("sentiment_parquet", run_context.run_id)
-    current_prefix = storage_manager.resolver.processed_current_prefix("sentiment_parquet")
-
-    log_event(
-        logger,
-        "s3_upload_started",
-        stage="sentiment_parquet",
-        run_id=run_context.run_id,
-        dag_id=run_context.dag_id,
-        task_id=run_context.task_id,
-        input_path=str(settings.sentiment_parquet_path),
-        output_path=run_prefix,
-        status="started",
-    )
-    uploaded = storage_manager.upload_directory(settings.sentiment_parquet_path, run_prefix)
-    log_event(
-        logger,
-        "s3_upload_completed",
-        stage="sentiment_parquet",
-        run_id=run_context.run_id,
-        dag_id=run_context.dag_id,
-        task_id=run_context.task_id,
-        input_path=str(settings.sentiment_parquet_path),
-        output_path=run_prefix,
-        file_count=len(uploaded),
-        status="success",
-    )
-    promotion = storage_manager.promote_run_prefix(
-        run_prefix,
-        current_prefix,
-        run_id=run_context.run_id,
-        metadata={"stage": "sentiment_parquet", "status": "success"},
-    )
-    log_event(
-        logger,
-        "latest_run_promoted",
-        stage="sentiment_parquet",
-        run_id=run_context.run_id,
-        dag_id=run_context.dag_id,
-        task_id=run_context.task_id,
-        output_path=current_prefix,
-        file_count=promotion["copied_count"],
-        status="success",
+        sentiment_backend=sentiment_backend.backend_name,
+        sentiment_model=sentiment_backend.model_name,
+        sentiment_fallback_reason=sentiment_backend.fallback_reason,
+        aspect_backend="ollama" if ollama_available else "heuristic",
     )
 
-    spark.stop()
+    enriched_count = _score_sentiment_with_arrow(
+        settings.normalized_parquet_path,
+        settings.sentiment_parquet_path,
+        sentiment_backend=sentiment_backend,
+        ollama_available=ollama_available,
+        ollama_host=settings.ollama_host,
+        ollama_model=settings.ollama_model,
+        ollama_timeout_seconds=settings.ollama_timeout_seconds,
+    )
+
+    if storage_manager is not None:
+        run_prefix = storage_manager.resolver.processed_run_prefix("sentiment_parquet", run_context.run_id)
+        current_prefix = storage_manager.resolver.processed_current_prefix("sentiment_parquet")
+
+        log_event(
+            logger,
+            "s3_upload_started",
+            stage="sentiment_parquet",
+            run_id=run_context.run_id,
+            dag_id=run_context.dag_id,
+            task_id=run_context.task_id,
+            input_path=str(settings.sentiment_parquet_path),
+            output_path=run_prefix,
+            status="started",
+        )
+        uploaded = storage_manager.upload_directory(settings.sentiment_parquet_path, run_prefix)
+        log_event(
+            logger,
+            "s3_upload_completed",
+            stage="sentiment_parquet",
+            run_id=run_context.run_id,
+            dag_id=run_context.dag_id,
+            task_id=run_context.task_id,
+            input_path=str(settings.sentiment_parquet_path),
+            output_path=run_prefix,
+            file_count=len(uploaded),
+            status="success",
+        )
+        promotion = storage_manager.promote_run_prefix(
+            run_prefix,
+            current_prefix,
+            run_id=run_context.run_id,
+            metadata={"stage": "sentiment_parquet", "status": "success"},
+        )
+        log_event(
+            logger,
+            "latest_run_promoted",
+            stage="sentiment_parquet",
+            run_id=run_context.run_id,
+            dag_id=run_context.dag_id,
+            task_id=run_context.task_id,
+            output_path=current_prefix,
+            file_count=promotion["copied_count"],
+            status="success",
+        )
+
     log_event(
         logger,
         "sentiment_scoring_completed",
@@ -235,6 +254,8 @@ def main() -> None:
         output_path=str(settings.sentiment_parquet_path),
         duration_ms=round((time.perf_counter() - started_at) * 1000, 2),
         status="success",
+        sentiment_backend=sentiment_backend.backend_name,
+        aspect_backend="ollama" if ollama_available else "heuristic",
     )
 
 

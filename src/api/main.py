@@ -17,6 +17,7 @@ import chromadb
 from fastapi import FastAPI, Query
 from pydantic import BaseModel
 from pyspark.sql import SparkSession
+from pyspark.sql.functions import coalesce, col, explode, length, lit, split, trim
 from sentence_transformers import SentenceTransformer
 
 try:
@@ -67,6 +68,8 @@ class SearchResponse(BaseModel):
     display_name: str
     display_category: str
     entity_type: str
+    aspect_labels: str = ""
+    aspect_count: int = 0
     sentiment_label: str
     sentiment_score: float
     source_url: str
@@ -80,6 +83,8 @@ class Citation(BaseModel):
     display_category: str
     entity_type: str
     source_url: str
+    aspect_labels: str = ""
+    aspect_count: int = 0
     sentiment_label: str
     sentiment_score: float
 
@@ -237,6 +242,8 @@ def retrieve_reviews(query: str, source_filter: Optional[str] = None, n_results:
                 "display_name": clean_display_name(metadata),
                 "display_category": clean_display_category(metadata),
                 "entity_type": clean_entity_type(metadata),
+                "aspect_labels": str(metadata.get("aspect_labels", "")),
+                "aspect_count": int(metadata.get("aspect_count", 0) or 0),
                 "sentiment_label": str(metadata.get("sentiment_label", "")),
                 "sentiment_score": float(metadata.get("sentiment_score", 0.0)),
                 "source_url": str(metadata.get("source_url", "")),
@@ -294,6 +301,7 @@ def generate_grounded_answer(query: str, retrieved: list[dict]) -> str:
                 f"Display Name: {item['display_name']}\n"
                 f"Display Category: {item['display_category']}\n"
                 f"Entity Type: {item['entity_type']}\n"
+                f"Aspects: {item.get('aspect_labels', '')}\n"
                 f"Sentiment: {item['sentiment_label']} ({item['sentiment_score']})\n"
                 f"URL: {item['source_url']}\n"
                 f"Text: {item['review_text']}\n"
@@ -350,6 +358,20 @@ def source_stats():
 
     counts = df.groupBy("source").count().collect()
     sentiment = df.groupBy("source", "sentiment_label").count().collect()
+    top_aspects = []
+    if "aspect_labels" in df.columns:
+        top_aspects = (
+            df.select(
+                explode(
+                    split(coalesce(col("aspect_labels"), lit("")), r"\s*,\s*")
+                ).alias("aspect")
+            )
+            .where(length(trim(col("aspect"))) > 0)
+            .groupBy("aspect")
+            .count()
+            .orderBy(col("count").desc(), col("aspect").asc())
+            .collect()
+        )
 
     spark.stop()
 
@@ -362,6 +384,13 @@ def source_stats():
                 "count": row["count"],
             }
             for row in sentiment
+        ],
+        "top_aspects": [
+            {
+                "aspect": row["aspect"],
+                "count": row["count"],
+            }
+            for row in top_aspects
         ],
     }
 
@@ -452,6 +481,8 @@ def chat(
             display_category=item["display_category"],
             entity_type=item["entity_type"],
             source_url=item["source_url"],
+            aspect_labels=item["aspect_labels"],
+            aspect_count=item["aspect_count"],
             sentiment_label=item["sentiment_label"],
             sentiment_score=item["sentiment_score"],
         )

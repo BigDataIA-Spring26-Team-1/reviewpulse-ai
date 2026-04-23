@@ -81,6 +81,11 @@ def render_search_result(item: dict, heading: str, link_label: str) -> None:
         st.write(f"Name: {item.get('display_name', '')}")
         st.write(f"Category: {item.get('display_category', '')}")
         st.write(f"Type: {item.get('entity_type', '')}")
+        if item.get("aspect_labels"):
+            st.write(
+                f"Aspects: {item.get('aspect_labels', '')} "
+                f"({int(item.get('aspect_count', 0) or 0)})"
+            )
         st.write(
             f"Sentiment: {pretty_sentiment_label(item.get('sentiment_label', ''))}"
         )
@@ -181,9 +186,11 @@ def render_ask_tab() -> None:
  
     source_counts = stats.get("source_counts", [])
     sentiment_breakdown = stats.get("sentiment_breakdown", [])
- 
+    top_aspects = stats.get("top_aspects", [])
+
     df_counts = pd.DataFrame(source_counts) if source_counts else pd.DataFrame()
     df_sentiment = pd.DataFrame(sentiment_breakdown) if sentiment_breakdown else pd.DataFrame()
+    df_top_aspects = pd.DataFrame(top_aspects) if top_aspects else pd.DataFrame()
  
     if not df_counts.empty:
         total_reviews = int(df_counts["count"].sum())
@@ -232,6 +239,13 @@ def render_ask_tab() -> None:
             st.bar_chart(pivot)
         else:
             st.info("No sentiment data available.")
+
+    st.markdown("### Top Aspects")
+    if not df_top_aspects.empty:
+        st.dataframe(df_top_aspects, use_container_width=True)
+        st.bar_chart(df_top_aspects.set_index("aspect"))
+    else:
+        st.info("No aspect data available.")
  
  
 def render_normalization_explanation(explanation: dict) -> None:

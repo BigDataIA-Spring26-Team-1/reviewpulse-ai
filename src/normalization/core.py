@@ -297,6 +297,8 @@ def normalize_ebay(raw: Mapping[str, Any]) -> dict[str, Any]:
     )
 
 
+
+
 def normalize_ifixit(raw: Mapping[str, Any]) -> dict[str, Any]:
     guide_id = str(raw.get("guide_id") or raw.get("source_id") or "unknown")
     title = str(raw.get("title") or raw.get("device_name") or guide_id)
@@ -310,7 +312,10 @@ def normalize_ifixit(raw: Mapping[str, Any]) -> dict[str, Any]:
         source="ifixit",
         rating_normalized=normalize_unit_scale(raw.get("repairability_score"), 1.0, 10.0),
         review_text=str(raw.get("review_text") or raw.get("text") or ""),
-        review_date=isoformat_from_datetime_string(raw.get("published_date")),
+        review_date=(
+            isoformat_from_datetime_string(raw.get("published_date"))
+            or isoformat_from_unix_seconds(raw.get("published_date"))
+        ),
         reviewer_id=str(raw.get("author") or "unknown"),
         verified_purchase=None,
         helpful_votes=_coerce_int(raw.get("helpful_votes")),

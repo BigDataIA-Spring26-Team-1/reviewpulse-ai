@@ -118,11 +118,13 @@ def build_spark() -> Any:
         ("SPARK_DRIVER_MEMORY", "spark.driver.memory"),
         ("SPARK_EXECUTOR_MEMORY", "spark.executor.memory"),
         ("SPARK_DRIVER_MAX_RESULT_SIZE", "spark.driver.maxResultSize"),
-        ("SPARK_LOCAL_DIR", "spark.local.dir"),
     ):
         value = os.getenv(env_name, "").strip()
         if value:
             builder = builder.config(spark_key, value)
+
+    spark_local_dir = _resolve_spark_local_dir(os.getenv("SPARK_LOCAL_DIR", "").strip())
+    builder = builder.config("spark.local.dir", str(spark_local_dir))
 
     shuffle_partitions = os.getenv("SPARK_SQL_SHUFFLE_PARTITIONS", "").strip() or "800"
     builder = (
@@ -173,6 +175,36 @@ def _optional_column(df: Any, column_name: str, *, cast_type: str | None = None)
     if cast_type is not None:
         expression = expression.cast(cast_type)
     return expression
+
+
+def _is_writable_directory(path: Path) -> bool:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe_path = path / ".reviewpulse-write-test"
+        probe_path.write_text("", encoding="utf-8")
+        probe_path.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def _resolve_spark_local_dir(configured_path: str) -> Path:
+    candidates: list[Path] = []
+    if configured_path:
+        configured = Path(configured_path)
+        candidates.append(configured if configured.is_absolute() else (PROJECT_ROOT / configured).resolve())
+    candidates.append((PROJECT_ROOT / ".runtime" / "spark-local").resolve())
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved_candidate = candidate.resolve()
+        if resolved_candidate in seen:
+            continue
+        seen.add(resolved_candidate)
+        if _is_writable_directory(resolved_candidate):
+            return resolved_candidate
+
+    raise RuntimeError("Unable to determine a writable Spark local directory.")
 
 
 def normalize_amazon(spark: Any) -> tuple[Any | None, Path | None]:
@@ -280,23 +312,68 @@ def normalize_ifixit(spark: Any) -> tuple[Any | None, Path | None]:
     if df is None:
         return None, None
 
+    guide_id = coalesce(
+        _optional_column(df, "guide_id", cast_type="string"),
+        _optional_column(df, "source_id", cast_type="string"),
+        lit("unknown"),
+    )
+    product_name = coalesce(
+        _optional_column(df, "device_name", cast_type="string"),
+        _optional_column(df, "title", cast_type="string"),
+        _optional_column(df, "guide_id", cast_type="string"),
+        lit("unknown"),
+    )
+    display_name = coalesce(
+        _optional_column(df, "title", cast_type="string"),
+        _optional_column(df, "device_name", cast_type="string"),
+        _optional_column(df, "guide_id", cast_type="string"),
+        lit("unknown"),
+    )
+    product_category = coalesce(
+        _optional_column(df, "device_category", cast_type="string"),
+        lit("repairability"),
+    )
+    display_category = coalesce(
+        _optional_column(df, "device_category", cast_type="string"),
+        lit("Repair Guide"),
+    )
+    review_text = coalesce(
+        _optional_column(df, "review_text", cast_type="string"),
+        _optional_column(df, "text", cast_type="string"),
+        lit(""),
+    )
+    published_date = _optional_column(df, "published_date", cast_type="string")
+    review_date = coalesce(
+        when(
+            published_date.rlike(r"^\d+$"),
+            to_timestamp(from_unixtime(_optional_column(df, "published_date", cast_type="bigint"))),
+        ).otherwise(to_timestamp(published_date)),
+        lit(None).cast("timestamp"),
+    )
+    reviewer_id = coalesce(
+        _optional_column(df, "author", cast_type="string"),
+        lit("unknown"),
+    )
+    helpful_votes = _optional_column(df, "helpful_votes", cast_type="int")
+    url_column = _optional_column(df, "url", cast_type="string")
+
     ifixit_df = df.select(
-        concat_ws("_", lit("ifixit"), coalesce(col("guide_id"), col("source_id"), lit("unknown"))).alias("review_id"),
-        coalesce(col("device_name"), col("title"), col("guide_id")).alias("product_name"),
-        coalesce(col("device_category"), lit("repairability")).alias("product_category"),
+        concat_ws("_", lit("ifixit"), guide_id).alias("review_id"),
+        product_name.alias("product_name"),
+        product_category.alias("product_category"),
         lit("ifixit").alias("source"),
         _scale_column("repairability_score", 1.0, 10.0).alias("rating_normalized"),
-        coalesce(col("review_text"), col("text"), lit("")).alias("review_text"),
-        to_timestamp(col("published_date")).alias("review_date"),
-        coalesce(col("author"), lit("unknown")).alias("reviewer_id"),
+        review_text.alias("review_text"),
+        review_date.alias("review_date"),
+        reviewer_id.alias("reviewer_id"),
         lit(None).cast("boolean").alias("verified_purchase"),
-        col("helpful_votes").cast("int").alias("helpful_votes"),
+        helpful_votes.alias("helpful_votes"),
         when(
-            col("url").isNotNull() & (trim(col("url")) != ""),
-            col("url"),
-        ).otherwise(concat_ws("", lit("https://www.ifixit.com/Guide/"), coalesce(col("guide_id"), lit("unknown")))).alias("source_url"),
-        coalesce(col("title"), col("device_name"), col("guide_id")).alias("display_name"),
-        coalesce(col("device_category"), lit("Repair Guide")).alias("display_category"),
+            url_column.isNotNull() & (trim(url_column) != ""),
+            url_column,
+        ).otherwise(concat_ws("", lit("https://www.ifixit.com/Guide/"), guide_id)).alias("source_url"),
+        display_name.alias("display_name"),
+        display_category.alias("display_category"),
         lit("repair_review").alias("entity_type"),
     )
     return ifixit_df, path

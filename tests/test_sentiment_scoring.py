@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -22,7 +23,10 @@ def test_score_sentiment_with_arrow_writes_scored_parquet(tmp_path: Path):
     source_table = pa.table(
         {
             "review_id": ["r1", "r2"],
-            "review_text": ["Great product and excellent fit", "Terrible quality and bad support"],
+            "review_text": [
+                "Great battery life and excellent reliability.",
+                "Terrible support and bad refund experience.",
+            ],
             "source": ["ebay", "ebay"],
         }
     )
@@ -35,3 +39,7 @@ def test_score_sentiment_with_arrow_writes_scored_parquet(tmp_path: Path):
     assert written[0]["sentiment_label"] == "positive"
     assert written[1]["sentiment_label"] == "negative"
     assert "sentiment_score" in written[0]
+    assert written[0]["aspect_labels"] == "battery"
+    assert written[0]["aspect_count"] == 1
+    assert json.loads(written[0]["aspect_details_json"])[0]["aspect"] == "battery"
+    assert written[1]["aspect_labels"] == "customer service"
