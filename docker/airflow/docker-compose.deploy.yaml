@@ -1,0 +1,76 @@
+services:
+  airflow:
+    build:
+      context: ../..
+      dockerfile: docker/airflow/Dockerfile
+    image: reviewpulse-airflow:deploy
+    container_name: reviewpulse-airflow
+    restart: unless-stopped
+    ports:
+      - "${AIRFLOW_HTTP_PORT:-8080}:8080"
+    environment:
+      AIRFLOW_HOME: /opt/airflow
+      AIRFLOW__CORE__AUTH_MANAGER: airflow.api_fastapi.auth.managers.simple.simple_auth_manager.SimpleAuthManager
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/reviewpulse/dags
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW_ADMIN_USERNAME: "${AIRFLOW_ADMIN_USERNAME:-admin}"
+      AIRFLOW_ADMIN_PASSWORD: "${AIRFLOW_ADMIN_PASSWORD:-}"
+      PYTHONPATH: /opt/reviewpulse
+      REVIEWPULSE_PROJECT_VENV: /opt/airflow/reviewpulse-venv
+      APP_ENV: "${APP_ENV:-production}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      NORMALIZATION_SOURCES: "${NORMALIZATION_SOURCES:-}"
+      DATA_DIR: /opt/reviewpulse/data
+      RAW_DATA_DIR: /opt/reviewpulse/data/raw
+      PROCESSED_DATA_DIR: /opt/reviewpulse/data/processed
+      PARQUET_INPUT_PATH: /opt/reviewpulse/data/normalized_reviews_parquet
+      PARQUET_OUTPUT_PATH: /opt/reviewpulse/data/reviews_with_sentiment_parquet
+      CHROMA_PATH: /opt/reviewpulse/data/chromadb_reviews
+      AWS_REGION: "${AWS_REGION:-us-east-1}"
+      AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-}"
+      AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY:-}"
+      AWS_SESSION_TOKEN: "${AWS_SESSION_TOKEN:-}"
+      S3_BUCKET_NAME: "${S3_BUCKET_NAME:-}"
+      S3_RAW_PREFIX: "${S3_RAW_PREFIX:-raw}"
+      S3_PROCESSED_PREFIX: "${S3_PROCESSED_PREFIX:-processed}"
+      HUGGINGFACE_TOKEN: "${HUGGINGFACE_TOKEN:-}"
+      AMAZON_DATASET_NAME: "${AMAZON_DATASET_NAME:-McAuley-Lab/Amazon-Reviews-2023}"
+      AMAZON_CATEGORY: "${AMAZON_CATEGORY:-Electronics}"
+      AMAZON_BATCH_SIZE: "${AMAZON_BATCH_SIZE:-10000}"
+      AMAZON_MAX_RECORDS: "${AMAZON_MAX_RECORDS:-0}"
+      YELP_DATASET_PATH: "${YELP_DATASET_PATH:-}"
+      YELP_DATASET_S3_URI: "${YELP_DATASET_S3_URI:-}"
+      EBAY_APP_ID: "${EBAY_APP_ID:-}"
+      EBAY_DEV_ID: "${EBAY_DEV_ID:-}"
+      EBAY_CERT_ID: "${EBAY_CERT_ID:-}"
+      EBAY_SITE_ID: "${EBAY_SITE_ID:-0}"
+      EBAY_ENVIRONMENT: "${EBAY_ENVIRONMENT:-production}"
+      EBAY_MARKETPLACE_ID: "${EBAY_MARKETPLACE_ID:-EBAY_US}"
+      EBAY_SEARCH_QUERIES: "${EBAY_SEARCH_QUERIES:-}"
+      EBAY_CATEGORY_IDS: "${EBAY_CATEGORY_IDS:-}"
+      EBAY_CRAWL_ALL_CATEGORIES: "${EBAY_CRAWL_ALL_CATEGORIES:-false}"
+      EBAY_MAX_ITEMS_PER_QUERY: "${EBAY_MAX_ITEMS_PER_QUERY:-50}"
+      IFIXIT_BASE_URL: "${IFIXIT_BASE_URL:-https://www.ifixit.com}"
+      IFIXIT_GUIDE_IDS: "${IFIXIT_GUIDE_IDS:-}"
+      IFIXIT_MAX_GUIDES: "${IFIXIT_MAX_GUIDES:-200}"
+      YOUTUBE_API_KEY: "${YOUTUBE_API_KEY:-}"
+      YOUTUBE_VIDEO_IDS: "${YOUTUBE_VIDEO_IDS:-}"
+      YOUTUBE_SEARCH_QUERIES: "${YOUTUBE_SEARCH_QUERIES:-}"
+      YOUTUBE_MAX_VIDEOS_PER_QUERY: "${YOUTUBE_MAX_VIDEOS_PER_QUERY:-10}"
+      YOUTUBE_TRANSCRIPT_LANGUAGES: "${YOUTUBE_TRANSCRIPT_LANGUAGES:-en}"
+      SPARK_MASTER: "${SPARK_MASTER:-local[*]}"
+      SPARK_SQL_SESSION_TIMEZONE: "${SPARK_SQL_SESSION_TIMEZONE:-UTC}"
+      SPARK_DRIVER_MEMORY: "${SPARK_DRIVER_MEMORY:-6g}"
+      SPARK_EXECUTOR_MEMORY: "${SPARK_EXECUTOR_MEMORY:-6g}"
+      SPARK_SQL_SHUFFLE_PARTITIONS: "${SPARK_SQL_SHUFFLE_PARTITIONS:-200}"
+      SPARK_DRIVER_MAX_RESULT_SIZE: "${SPARK_DRIVER_MAX_RESULT_SIZE:-1g}"
+      SPARK_LOCAL_DIR: /opt/airflow/spark-tmp
+    volumes:
+      - airflow_home:/opt/airflow
+      - reviewpulse_data:/opt/reviewpulse/data
+    command: bash /opt/reviewpulse/docker/airflow/run-airflow-standalone.sh
+
+volumes:
+  airflow_home:
+  reviewpulse_data:
