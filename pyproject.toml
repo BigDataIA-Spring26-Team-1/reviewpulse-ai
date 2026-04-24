@@ -24,6 +24,7 @@ python-dotenv = "^1.1.0"
 praw = "^7.8.1"
 youtube-transcript-api = "^1.0.3"
 datasets = "^3.5.0"
+snowflake-connector-python = "^4.4.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.5"

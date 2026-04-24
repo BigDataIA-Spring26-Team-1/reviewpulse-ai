@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional
 
@@ -18,7 +19,6 @@ from fastapi import FastAPI, Query
 from pydantic import BaseModel
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import coalesce, col, explode, length, lit, split, trim
-from sentence_transformers import SentenceTransformer
 
 try:
     from dotenv import load_dotenv
@@ -38,6 +38,7 @@ from src.insights import (
     build_quality_metrics,
     build_source_comparison,
 )
+from src.retrieval.embedding_backend import encode_texts, load_embedding_backend
 
 
 try:
@@ -104,8 +105,21 @@ def get_spark() -> SparkSession:
     )
 
 
-def get_model() -> SentenceTransformer:
-    return SentenceTransformer(EMBEDDING_MODEL)
+@lru_cache(maxsize=1)
+def get_embedding_backend():
+    return load_embedding_backend(
+        chroma_path=settings.chroma_path,
+        model_name=EMBEDDING_MODEL,
+    )
+
+
+def encode_query_text(query: str) -> list[float]:
+    return encode_texts(
+        get_embedding_backend(),
+        [query],
+        batch_size=1,
+        show_progress_bar=False,
+    )[0]
 
 
 def get_collection():
@@ -216,9 +230,11 @@ def retrieve_reviews(query: str, source_filter: Optional[str] = None, n_results:
     if not os.path.exists(CHROMA_DIR):
         return []
 
-    model = get_model()
-    collection = get_collection()
-    query_embedding = model.encode([query])[0].tolist()
+    try:
+        collection = get_collection()
+        query_embedding = encode_query_text(query)
+    except Exception:
+        return []
 
     where = {"source": source_filter.lower()} if source_filter else None
     results = collection.query(

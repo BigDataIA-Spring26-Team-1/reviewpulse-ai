@@ -8,18 +8,11 @@ Run:
 from __future__ import annotations
 
 import os
-import sys
-from pathlib import Path
 
 import chromadb
-from sentence_transformers import SentenceTransformer
-
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.common.settings import get_settings
+from src.retrieval.embedding_backend import encode_texts, load_embedding_backend
 
 
 def main() -> None:
@@ -35,8 +28,11 @@ def main() -> None:
         return
 
     model_name = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-    print(f"Loading embedding model: {model_name}")
-    model = SentenceTransformer(model_name)
+    embedding_backend = load_embedding_backend(
+        chroma_path=settings.chroma_path,
+        model_name=model_name,
+    )
+    print(f"Loading embedding backend: {embedding_backend.backend_name} ({embedding_backend.model_name})")
 
     client = chromadb.PersistentClient(path=str(settings.chroma_path))
     collection = client.get_collection(
@@ -50,7 +46,12 @@ def main() -> None:
         if not query:
             continue
 
-        query_embedding = model.encode([query])[0].tolist()
+        query_embedding = encode_texts(
+            embedding_backend,
+            [query],
+            batch_size=1,
+            show_progress_bar=False,
+        )[0]
         results = collection.query(
             query_embeddings=[query_embedding],
             n_results=5,
