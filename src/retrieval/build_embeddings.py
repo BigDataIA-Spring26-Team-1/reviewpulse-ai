@@ -8,6 +8,7 @@ Run:
 from __future__ import annotations
 
 import importlib
+import json
 import logging
 import os
 import shutil
@@ -34,6 +35,10 @@ from src.retrieval.embedding_backend import (
     load_embedding_backend,
     write_embedding_backend_metadata,
 )
+from src.retrieval.sqlite_vector_store import (
+    SQLiteReviewVectorStore,
+    write_vector_store_metadata,
+)
 
 
 DEPENDENCY_SETUP_HINT = (
@@ -56,6 +61,7 @@ EMBEDDING_COLUMNS = (
     "review_date",
     "source_url",
 )
+EMBEDDING_PROGRESS_FILENAME = "_EMBEDDING_PROGRESS.json"
 
 
 def _require_chromadb():
@@ -78,6 +84,74 @@ def _resolve_positive_int_env(name: str, default: int) -> int:
         return max(1, int(raw_value))
     except ValueError:
         return default
+
+
+def _resolve_vector_store_backend() -> str:
+    raw_value = os.getenv("VECTOR_STORE_BACKEND", "auto").strip().lower()
+    if raw_value in {"sqlite", "sqlite-fts", "sqlite_fts"}:
+        return "sqlite-fts"
+    if raw_value == "chroma":
+        return "chroma"
+    if raw_value == "auto":
+        return "sqlite-fts" if os.name == "nt" else "chroma"
+    return "sqlite-fts" if os.name == "nt" else "chroma"
+
+
+def _env_flag_enabled(name: str, default: bool) -> bool:
+    raw_value = os.getenv(name, "").strip().lower()
+    if not raw_value:
+        return default
+    return raw_value not in {"0", "false", "no", "off"}
+
+
+def _embedding_progress_path(chroma_path: Path) -> Path:
+    return chroma_path / EMBEDDING_PROGRESS_FILENAME
+
+
+def _read_embedding_progress(chroma_path: Path) -> dict[str, Any] | None:
+    progress_path = _embedding_progress_path(chroma_path)
+    if not progress_path.exists():
+        return None
+    return json.loads(progress_path.read_text(encoding="utf-8"))
+
+
+def _write_embedding_progress(chroma_path: Path, payload: dict[str, Any]) -> Path:
+    chroma_path.mkdir(parents=True, exist_ok=True)
+    progress_path = _embedding_progress_path(chroma_path)
+    progress_path.write_text(
+        json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    return progress_path
+
+
+def _validate_embedding_resume_progress(
+    progress: dict[str, Any],
+    *,
+    input_path: Path,
+    row_batch_size: int,
+    encode_batch_size: int,
+    chroma_batch_size: int,
+    embedding_model_name: str,
+    vector_store_backend: str,
+) -> None:
+    expected = {
+        "input_path": str(input_path),
+        "row_batch_size": row_batch_size,
+        "encode_batch_size": encode_batch_size,
+        "chroma_batch_size": chroma_batch_size,
+        "embedding_model": embedding_model_name,
+        "vector_store_backend": vector_store_backend,
+    }
+    mismatches = [
+        name for name, value in expected.items()
+        if progress.get(name) != value
+    ]
+    if mismatches:
+        raise RuntimeError(
+            "Cannot resume embeddings because the saved progress marker does not "
+            f"match this run for: {', '.join(mismatches)}"
+        )
 
 
 def _normalize_embedding_row(raw_row: dict[str, object]) -> dict[str, object]:
@@ -177,6 +251,26 @@ def _upsert_embedding_payloads(
     return len(documents)
 
 
+def _upsert_sqlite_payloads(
+    store: SQLiteReviewVectorStore,
+    embedding_backend: Any,
+    payloads: list[tuple[str, str, dict[str, object]]],
+    *,
+    encode_batch_size: int,
+) -> int:
+    if not payloads:
+        return 0
+
+    documents = [payload[1] for payload in payloads]
+    embeddings = encode_texts(
+        embedding_backend,
+        documents,
+        batch_size=encode_batch_size,
+        show_progress_bar=False,
+    )
+    return store.upsert(payloads, embeddings)
+
+
 def main() -> None:
     settings = get_settings()
     configure_structured_logging(settings.log_level)
@@ -215,12 +309,32 @@ def main() -> None:
         )
         raise RuntimeError("Sentiment parquet not found. Run sentiment scoring first.")
 
+    resume_enabled = _env_flag_enabled("EMBEDDING_RESUME", False)
     embedding_backend = load_embedding_backend(
+        chroma_path=settings.chroma_path if resume_enabled else None,
         model_name=os.getenv("EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
     )
     row_batch_size = _resolve_positive_int_env("EMBEDDING_ROW_BATCH_SIZE", 5000)
     encode_batch_size = _resolve_positive_int_env("EMBEDDING_ENCODE_BATCH_SIZE", 64)
     chroma_batch_size = _resolve_positive_int_env("CHROMA_ADD_BATCH_SIZE", 500)
+    vector_store_backend = _resolve_vector_store_backend()
+    resume_progress = _read_embedding_progress(settings.chroma_path) if resume_enabled else None
+    resume_batches = 0
+    resume_input_rows = 0
+    resume_embedded_rows = 0
+    if resume_progress:
+        _validate_embedding_resume_progress(
+            resume_progress,
+            input_path=settings.sentiment_parquet_path,
+            row_batch_size=row_batch_size,
+            encode_batch_size=encode_batch_size,
+            chroma_batch_size=chroma_batch_size,
+            embedding_model_name=embedding_backend.model_name,
+            vector_store_backend=vector_store_backend,
+        )
+        resume_batches = int(resume_progress.get("input_batches_completed", 0) or 0)
+        resume_input_rows = int(resume_progress.get("input_rows_seen", 0) or 0)
+        resume_embedded_rows = int(resume_progress.get("embedded_rows", 0) or 0)
 
     log_event(
         logger,
@@ -237,37 +351,89 @@ def main() -> None:
         embedding_backend=embedding_backend.backend_name,
         embedding_model=embedding_backend.model_name,
         embedding_fallback_reason=embedding_backend.fallback_reason,
+        vector_store_backend=vector_store_backend,
+        resume_enabled=resume_enabled,
+        resumed_batches=resume_batches,
     )
 
-    if settings.chroma_path.exists():
+    if settings.chroma_path.exists() and not resume_enabled:
         shutil.rmtree(settings.chroma_path)
 
-    chromadb = _require_chromadb()
-    client = chromadb.PersistentClient(path=str(settings.chroma_path))
-    collection = client.get_or_create_collection(
-        name=os.getenv("CHROMA_COLLECTION_NAME", "reviewpulse_reviews")
-    )
+    collection = None
+    sqlite_store = None
+    if vector_store_backend == "chroma":
+        chromadb = _require_chromadb()
+        client = chromadb.PersistentClient(path=str(settings.chroma_path))
+        collection = client.get_or_create_collection(
+            name=os.getenv("CHROMA_COLLECTION_NAME", "reviewpulse_reviews")
+        )
+    else:
+        sqlite_store = SQLiteReviewVectorStore(settings.chroma_path)
+        sqlite_store.initialize()
 
-    total_input_rows = 0
-    total_embedded_rows = 0
-    last_logged_rows = 0
+    total_input_rows = resume_input_rows
+    total_embedded_rows = resume_embedded_rows
+    input_batches_completed = resume_batches
+    last_logged_rows = resume_embedded_rows
     progress_interval = _resolve_positive_int_env("EMBEDDING_PROGRESS_INTERVAL_ROWS", 50000)
-    for rows in _iter_embedding_batches_with_arrow(
+    if resume_batches:
+        log_event(
+            logger,
+            "embeddings_generation_progress",
+            stage=run_context.stage,
+            run_id=run_context.run_id,
+            dag_id=run_context.dag_id,
+            task_id=run_context.task_id,
+            input_batches_completed=input_batches_completed,
+            input_rows_seen=total_input_rows,
+            embedded_rows=total_embedded_rows,
+            status="running",
+        )
+
+    for batch_index, rows in enumerate(_iter_embedding_batches_with_arrow(
         settings.sentiment_parquet_path,
         row_batch_size=row_batch_size,
-    ):
+    )):
+        if batch_index < resume_batches:
+            continue
+
         total_input_rows += len(rows)
         payloads = [
             payload
             for row in rows
             if (payload := _build_chroma_payload(row)) is not None
         ]
-        total_embedded_rows += _upsert_embedding_payloads(
-            collection,
-            embedding_backend,
-            payloads,
-            encode_batch_size=encode_batch_size,
-            chroma_batch_size=chroma_batch_size,
+        if sqlite_store is not None:
+            total_embedded_rows += _upsert_sqlite_payloads(
+                sqlite_store,
+                embedding_backend,
+                payloads,
+                encode_batch_size=encode_batch_size,
+            )
+        else:
+            total_embedded_rows += _upsert_embedding_payloads(
+                collection,
+                embedding_backend,
+                payloads,
+                encode_batch_size=encode_batch_size,
+                chroma_batch_size=chroma_batch_size,
+            )
+        input_batches_completed += 1
+        _write_embedding_progress(
+            settings.chroma_path,
+            {
+                "status": "running",
+                "input_path": str(settings.sentiment_parquet_path),
+                "input_batches_completed": input_batches_completed,
+                "input_rows_seen": total_input_rows,
+                "embedded_rows": total_embedded_rows,
+                "row_batch_size": row_batch_size,
+                "encode_batch_size": encode_batch_size,
+                "chroma_batch_size": chroma_batch_size,
+                "embedding_backend": embedding_backend.backend_name,
+                "embedding_model": embedding_backend.model_name,
+                "vector_store_backend": vector_store_backend,
+            },
         )
 
         if total_embedded_rows - last_logged_rows >= progress_interval:
@@ -279,6 +445,7 @@ def main() -> None:
                 run_id=run_context.run_id,
                 dag_id=run_context.dag_id,
                 task_id=run_context.task_id,
+                input_batches_completed=input_batches_completed,
                 input_rows_seen=total_input_rows,
                 embedded_rows=total_embedded_rows,
                 status="running",
@@ -301,7 +468,31 @@ def main() -> None:
     if total_embedded_rows == 0:
         raise RuntimeError("No sufficiently long review_text values were found for embedding.")
 
+    if sqlite_store is not None:
+        sqlite_store.close()
+
     write_embedding_backend_metadata(settings.chroma_path, embedding_backend)
+    write_vector_store_metadata(
+        settings.chroma_path,
+        backend_name=vector_store_backend,
+        embedding_dimensions=getattr(embedding_backend.model, "dimensions", None),
+    )
+    _write_embedding_progress(
+        settings.chroma_path,
+        {
+            "status": "success",
+            "input_path": str(settings.sentiment_parquet_path),
+            "input_batches_completed": input_batches_completed,
+            "input_rows_seen": total_input_rows,
+            "embedded_rows": total_embedded_rows,
+            "row_batch_size": row_batch_size,
+            "encode_batch_size": encode_batch_size,
+            "chroma_batch_size": chroma_batch_size,
+            "embedding_backend": embedding_backend.backend_name,
+            "embedding_model": embedding_backend.model_name,
+            "vector_store_backend": vector_store_backend,
+        },
+    )
 
     if storage_manager is not None:
         run_prefix = storage_manager.resolver.processed_run_prefix("chromadb", run_context.run_id)
@@ -362,6 +553,7 @@ def main() -> None:
         duration_ms=round((time.perf_counter() - started_at) * 1000, 2),
         status="success",
         embedding_backend=embedding_backend.backend_name,
+        vector_store_backend=vector_store_backend,
     )
 
 

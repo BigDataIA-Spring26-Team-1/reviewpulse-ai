@@ -10,15 +10,16 @@ from __future__ import annotations
 import os
 import re
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Any, Optional
 
 import chromadb
+import pyarrow as pa
+import pyarrow.dataset as ds
 from fastapi import FastAPI, Query
 from pydantic import BaseModel
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import coalesce, col, explode, length, lit, split, trim
-from sentence_transformers import SentenceTransformer
 
 try:
     from dotenv import load_dotenv
@@ -38,6 +39,12 @@ from src.insights import (
     build_quality_metrics,
     build_source_comparison,
 )
+from src.retrieval.embedding_backend import (
+    DEFAULT_EMBEDDING_MODEL,
+    encode_texts,
+    load_embedding_backend,
+)
+from src.retrieval.sqlite_vector_store import SQLiteReviewVectorStore, sqlite_store_exists
 
 
 try:
@@ -53,9 +60,9 @@ settings = get_settings()
 
 CHROMA_DIR = str(settings.chroma_path)
 PARQUET_PATH = str(settings.sentiment_parquet_path)
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-sonnet-20240229")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
 CHROMA_COLLECTION_NAME = os.getenv("CHROMA_COLLECTION_NAME", "reviewpulse_reviews")
 
 app = FastAPI(title="ReviewPulse AI API", version="0.1.0")
@@ -104,8 +111,11 @@ def get_spark() -> SparkSession:
     )
 
 
-def get_model() -> SentenceTransformer:
-    return SentenceTransformer(EMBEDDING_MODEL)
+def get_embedding_backend():
+    return load_embedding_backend(
+        chroma_path=settings.chroma_path,
+        model_name=EMBEDDING_MODEL,
+    )
 
 
 def get_collection():
@@ -134,6 +144,57 @@ def load_insights_rows() -> tuple[list[dict[str, Any]] | None, Path | None]:
         spark.stop()
 
     return rows, dataset_path
+
+
+def build_source_stats_with_arrow(parquet_path: str | Path) -> dict[str, list[dict[str, Any]]]:
+    dataset = ds.dataset(str(parquet_path), format="parquet")
+    available_columns = set(dataset.schema.names)
+    requested_columns = [
+        column
+        for column in ("source", "sentiment_label", "aspect_labels")
+        if column in available_columns
+    ]
+
+    source_counts: Counter[str] = Counter()
+    sentiment_counts: Counter[tuple[str, str]] = Counter()
+    aspect_counts: Counter[str] = Counter()
+    batch_size = int(os.getenv("API_STATS_BATCH_SIZE", "100000"))
+
+    for record_batch in dataset.to_batches(
+        columns=requested_columns,
+        batch_size=max(1, batch_size),
+    ):
+        table = pa.Table.from_batches([record_batch])
+        data = table.to_pydict()
+        sources = [str(value or "") for value in data.get("source", [])]
+        sentiments = [str(value or "") for value in data.get("sentiment_label", [])]
+        aspects = [str(value or "") for value in data.get("aspect_labels", [])]
+
+        source_counts.update(sources)
+        sentiment_counts.update(zip(sources, sentiments))
+        for aspect_value in aspects:
+            for aspect in re.split(r"\s*,\s*", aspect_value):
+                cleaned = aspect.strip()
+                if cleaned:
+                    aspect_counts[cleaned] += 1
+
+    return {
+        "source_counts": [
+            {"source": source, "count": count}
+            for source, count in sorted(source_counts.items())
+        ],
+        "sentiment_breakdown": [
+            {"source": source, "sentiment_label": sentiment, "count": count}
+            for (source, sentiment), count in sorted(sentiment_counts.items())
+        ],
+        "top_aspects": [
+            {"aspect": aspect, "count": count}
+            for aspect, count in sorted(
+                aspect_counts.items(),
+                key=lambda item: (-item[1], item[0]),
+            )
+        ],
+    }
 
 
 def looks_like_machine_id(value: str) -> bool:
@@ -216,9 +277,30 @@ def retrieve_reviews(query: str, source_filter: Optional[str] = None, n_results:
     if not os.path.exists(CHROMA_DIR):
         return []
 
-    model = get_model()
+    embedding_backend = get_embedding_backend()
+    if sqlite_store_exists(settings.chroma_path):
+        store = SQLiteReviewVectorStore(settings.chroma_path)
+        try:
+            results = store.search(
+                query=query,
+                embedding_backend=embedding_backend,
+                source_filter=source_filter,
+                n_results=n_results,
+            )
+        finally:
+            store.close()
+        return [
+            {
+                **item,
+                "display_name": clean_display_name(item),
+                "display_category": clean_display_category(item),
+                "entity_type": clean_entity_type(item),
+            }
+            for item in results
+        ]
+
     collection = get_collection()
-    query_embedding = model.encode([query])[0].tolist()
+    query_embedding = encode_texts(embedding_backend, [query])[0]
 
     where = {"source": source_filter.lower()} if source_filter else None
     results = collection.query(
@@ -353,46 +435,7 @@ def source_stats():
     if not os.path.exists(PARQUET_PATH):
         return {"error": "Sentiment parquet not found. Run the earlier pipeline steps first."}
 
-    spark = get_spark()
-    df = spark.read.parquet(PARQUET_PATH)
-
-    counts = df.groupBy("source").count().collect()
-    sentiment = df.groupBy("source", "sentiment_label").count().collect()
-    top_aspects = []
-    if "aspect_labels" in df.columns:
-        top_aspects = (
-            df.select(
-                explode(
-                    split(coalesce(col("aspect_labels"), lit("")), r"\s*,\s*")
-                ).alias("aspect")
-            )
-            .where(length(trim(col("aspect"))) > 0)
-            .groupBy("aspect")
-            .count()
-            .orderBy(col("count").desc(), col("aspect").asc())
-            .collect()
-        )
-
-    spark.stop()
-
-    return {
-        "source_counts": [{"source": row["source"], "count": row["count"]} for row in counts],
-        "sentiment_breakdown": [
-            {
-                "source": row["source"],
-                "sentiment_label": row["sentiment_label"],
-                "count": row["count"],
-            }
-            for row in sentiment
-        ],
-        "top_aspects": [
-            {
-                "aspect": row["aspect"],
-                "count": row["count"],
-            }
-            for row in top_aspects
-        ],
-    }
+    return build_source_stats_with_arrow(PARQUET_PATH)
 
 
 @app.get("/data/profile")

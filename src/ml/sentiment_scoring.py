@@ -12,6 +12,7 @@ import os
 import shutil
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pyarrow as pa
@@ -49,6 +50,60 @@ def _write_parquet_rows_with_arrow(rows: list[dict[str, object]], output_path: P
     output_path.mkdir(parents=True, exist_ok=True)
     table = pa.Table.from_pylist(rows)
     pq.write_table(table, output_path / "part-00000.parquet", compression="snappy")
+
+
+def _sentiment_part_index(path: Path) -> int | None:
+    if not path.name.startswith("part-") or path.suffix != ".parquet":
+        return None
+    try:
+        return int(path.stem.removeprefix("part-"))
+    except ValueError:
+        return None
+
+
+def _find_resumable_sentiment_parts(
+    output_path: Path,
+    *,
+    expected_batch_size: int,
+    expected_total_rows: int | None = None,
+) -> tuple[int, int]:
+    if not output_path.exists():
+        return 0, 0
+
+    indexed_parts = sorted(
+        (index, path)
+        for path in output_path.glob("part-*.parquet")
+        if (index := _sentiment_part_index(path)) is not None
+    )
+    if not indexed_parts:
+        return 0, 0
+
+    expected_indices = list(range(len(indexed_parts)))
+    actual_indices = [index for index, _path in indexed_parts]
+    if actual_indices != expected_indices:
+        raise RuntimeError(
+            "Cannot resume sentiment scoring because output parquet parts are not contiguous "
+            f"from part-00000: {actual_indices[:10]}"
+        )
+
+    existing_rows = 0
+    for index, part_path in indexed_parts:
+        row_count = pq.ParquetFile(part_path).metadata.num_rows
+        if row_count <= 0:
+            raise RuntimeError(f"Cannot resume sentiment scoring from empty parquet part: {part_path}")
+        final_complete_part = (
+            expected_total_rows is not None
+            and existing_rows + row_count == expected_total_rows
+            and row_count <= expected_batch_size
+        )
+        if row_count != expected_batch_size and not final_complete_part:
+            raise RuntimeError(
+                "Cannot safely resume sentiment scoring because the existing final part is "
+                f"not a full batch: {part_path} has {row_count} rows."
+            )
+        existing_rows += row_count
+
+    return len(indexed_parts), existing_rows
 
 
 def _env_flag_enabled(name: str, default: bool) -> bool:
@@ -100,6 +155,9 @@ def _score_sentiment_with_arrow(
     ollama_model: str | None = None,
     ollama_timeout_seconds: int | None = None,
     row_batch_size: int | None = None,
+    resume: bool | None = None,
+    progress_callback: Callable[[dict[str, int]], None] | None = None,
+    progress_interval_parts: int | None = None,
 ) -> int:
     dataset = ds.dataset(str(input_path), format="parquet")
     resolved_batch_size = int(row_batch_size or os.getenv("SENTIMENT_ROW_BATCH_SIZE", "50000"))
@@ -119,14 +177,39 @@ def _score_sentiment_with_arrow(
         if ollama_available is None
         else aspect_backend in {"auto", "ollama"} and ollama_available
     )
+    resume_enabled = _env_flag_enabled("SENTIMENT_RESUME", False) if resume is None else resume
+    progress_interval = max(
+        1,
+        int(progress_interval_parts or os.getenv("SENTIMENT_PROGRESS_INTERVAL_PARTS", "10")),
+    )
 
-    if output_path.exists():
+    skipped_batches = 0
+    existing_rows = 0
+    if resume_enabled:
+        skipped_batches, existing_rows = _find_resumable_sentiment_parts(
+            output_path,
+            expected_batch_size=resolved_batch_size,
+            expected_total_rows=dataset.count_rows(),
+        )
+    elif output_path.exists():
         shutil.rmtree(output_path)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    total_rows = 0
-    part_index = 0
-    for record_batch in dataset.to_batches(batch_size=resolved_batch_size):
+    total_rows = existing_rows
+    part_index = skipped_batches
+    if progress_callback and skipped_batches:
+        progress_callback(
+            {
+                "part_count": part_index,
+                "record_count": total_rows,
+                "skipped_batches": skipped_batches,
+            }
+        )
+
+    for batch_index, record_batch in enumerate(dataset.to_batches(batch_size=resolved_batch_size)):
+        if batch_index < skipped_batches:
+            continue
+
         rows = pa.Table.from_batches([record_batch]).to_pylist()
         if not rows:
             continue
@@ -168,6 +251,17 @@ def _score_sentiment_with_arrow(
         )
         total_rows += len(enriched_rows)
         part_index += 1
+        if progress_callback and (
+            part_index == skipped_batches + 1
+            or part_index % progress_interval == 0
+        ):
+            progress_callback(
+                {
+                    "part_count": part_index,
+                    "record_count": total_rows,
+                    "skipped_batches": skipped_batches,
+                }
+            )
 
     if total_rows == 0:
         _write_parquet_rows_with_arrow([], output_path)
@@ -226,6 +320,7 @@ def main() -> None:
         if not _env_flag_enabled("ASPECT_EXTRACTION_ENABLED", True)
         else "ollama" if ollama_available else "heuristic"
     )
+    resume_enabled = _env_flag_enabled("SENTIMENT_RESUME", False)
 
     log_event(
         logger,
@@ -240,7 +335,22 @@ def main() -> None:
         sentiment_model=sentiment_backend.model_name,
         sentiment_fallback_reason=sentiment_backend.fallback_reason,
         aspect_backend=aspect_backend,
+        resume_enabled=resume_enabled,
     )
+
+    def log_sentiment_progress(progress: dict[str, int]) -> None:
+        log_event(
+            logger,
+            "sentiment_scoring_progress",
+            stage=run_context.stage,
+            run_id=run_context.run_id,
+            dag_id=run_context.dag_id,
+            task_id=run_context.task_id,
+            status="running",
+            part_count=progress["part_count"],
+            record_count=progress["record_count"],
+            skipped_batches=progress.get("skipped_batches", 0),
+        )
 
     enriched_count = _score_sentiment_with_arrow(
         settings.normalized_parquet_path,
@@ -250,6 +360,8 @@ def main() -> None:
         ollama_host=settings.ollama_host,
         ollama_model=settings.ollama_model,
         ollama_timeout_seconds=settings.ollama_timeout_seconds,
+        resume=resume_enabled,
+        progress_callback=log_sentiment_progress,
     )
 
     if storage_manager is not None:
