@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -136,6 +137,51 @@ class S3StorageManager:
         self.client.download_file(bucket, key, str(local_path))
         return local_path
 
+    def download_prefix(
+        self,
+        source_prefix_uri: str,
+        local_dir: Path,
+        *,
+        clear_destination: bool = False,
+        exclude_latest_marker: bool = True,
+    ) -> list[Path]:
+        """Download an S3 prefix into a local directory using relative keys."""
+        source_bucket, source_prefix = parse_s3_uri(source_prefix_uri)
+        source_prefix = source_prefix.rstrip("/") + "/"
+
+        download_plan: list[tuple[str, Path]] = []
+        for source_uri in self.list_objects(source_prefix_uri):
+            bucket, source_key = parse_s3_uri(source_uri)
+            if bucket != source_bucket or not source_key.startswith(source_prefix):
+                continue
+
+            relative_key = source_key[len(source_prefix):].lstrip("/")
+            if not relative_key or relative_key.endswith("/"):
+                continue
+            if exclude_latest_marker and relative_key == "_LATEST_RUN.json":
+                continue
+
+            parts = tuple(part for part in relative_key.replace("\\", "/").split("/") if part)
+            if any(part in {".", ".."} for part in parts):
+                raise ValueError(f"Unsafe S3 key relative path: {relative_key}")
+
+            local_path = local_dir.joinpath(*parts)
+            download_plan.append((source_uri, local_path))
+
+        if not download_plan:
+            return []
+
+        if clear_destination and local_dir.exists():
+            shutil.rmtree(local_dir)
+        local_dir.mkdir(parents=True, exist_ok=True)
+
+        downloaded_paths: list[Path] = []
+        for source_uri, local_path in download_plan:
+            self.download_file(source_uri, local_path)
+            downloaded_paths.append(local_path)
+
+        return downloaded_paths
+
     def count_lines(self, source_uri: str, *, chunk_size: int = 1024 * 1024) -> int:
         bucket, key = parse_s3_uri(source_uri)
         response = self.client.get_object(Bucket=bucket, Key=key)
@@ -239,11 +285,26 @@ class S3StorageManager:
             raise RuntimeError(f"No S3 objects found under run prefix: {run_prefix_uri}")
 
         total_objects = len(source_objects)
-        removed_count = self.delete_prefix(current_prefix_uri)
         copied_count = 0
 
         source_bucket, source_prefix = parse_s3_uri(run_prefix_uri)
         current_bucket, current_prefix = parse_s3_uri(current_prefix_uri)
+        marker_uri = self.resolver.marker_uri(current_prefix_uri)
+        desired_current_uris: set[str] = set()
+
+        for source_uri in source_objects:
+            _, source_key = parse_s3_uri(source_uri)
+            relative_key = source_key[len(source_prefix):].lstrip("/")
+            destination_key = "/".join(
+                part for part in [current_prefix.rstrip("/"), relative_key] if part
+            )
+            desired_current_uris.add(join_s3_uri(current_bucket, destination_key))
+
+        stale_current_objects = [
+            uri for uri in self.list_objects(current_prefix_uri)
+            if uri != marker_uri and uri not in desired_current_uris
+        ]
+        removed_count = len(stale_current_objects)
 
         for source_uri in source_objects:
             _, source_key = parse_s3_uri(source_uri)
@@ -270,12 +331,26 @@ class S3StorageManager:
                     }
                 )
 
+        if stale_current_objects:
+            bucket, _ = parse_s3_uri(current_prefix_uri)
+            for index in range(0, len(stale_current_objects), 1000):
+                batch = stale_current_objects[index:index + 1000]
+                self.client.delete_objects(
+                    Bucket=bucket,
+                    Delete={
+                        "Objects": [
+                            {"Key": parse_s3_uri(uri)[1]}
+                            for uri in batch
+                        ]
+                    },
+                )
+
         marker_payload = {
             "run_id": run_id,
             "promoted_at": datetime.now(UTC).isoformat(),
             **(metadata or {}),
         }
-        marker_uri = self.write_json(self.resolver.marker_uri(current_prefix_uri), marker_payload)
+        marker_uri = self.write_json(marker_uri, marker_payload)
         return {
             "copied_count": copied_count,
             "removed_count": removed_count,

@@ -15,6 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.retrieval.build_embeddings import (
     EMBEDDING_COLUMNS,
+    _iter_embedding_batches_with_arrow,
     _load_embedding_rows_with_arrow,
     _prepare_embedding_dataframe,
 )
@@ -101,6 +102,31 @@ def test_load_embedding_rows_with_arrow_reads_all_embedding_columns(tmp_path: Pa
     ]
 
 
+def test_iter_embedding_batches_with_arrow_streams_rows(tmp_path: Path):
+    input_path = tmp_path / "reviews_with_sentiment_parquet"
+    input_path.mkdir(parents=True, exist_ok=True)
+
+    table = pa.table(
+        {
+            "review_id": ["r1", "r2", "r3"],
+            "review_text": [
+                "A long enough review body to embed cleanly.",
+                "Another long enough review body to embed cleanly.",
+                "A third long enough review body to embed cleanly.",
+            ],
+            "source": ["ebay", "youtube", "ifixit"],
+        }
+    )
+    pq.write_table(table, input_path / "part-00000.parquet", compression="snappy")
+
+    batches = list(_iter_embedding_batches_with_arrow(input_path, row_batch_size=2))
+
+    assert [len(batch) for batch in batches] == [2, 1]
+    assert batches[0][0]["review_id"] == "r1"
+    assert batches[0][0]["aspect_count"] == 0
+    assert batches[0][0]["sentiment_score"] == 0.0
+
+
 def test_hashing_embedding_model_is_deterministic():
     model = HashingEmbeddingModel(dimensions=32)
 
@@ -131,6 +157,14 @@ def test_load_embedding_backend_falls_back_when_sentence_transformers_fails(monk
     assert backend.model_name == "hashing-24"
     assert backend.fallback_reason is not None
     assert len(encoded[0]) == 24
+
+
+def test_load_embedding_backend_can_force_hashing_model():
+    backend = load_embedding_backend(model_name="hashing-32")
+
+    assert backend.backend_name == "hashing"
+    assert backend.model_name == "hashing-32"
+    assert len(encode_texts(backend, ["query text"])[0]) == 32
 
 
 def test_load_embedding_backend_uses_hashing_metadata(tmp_path: Path):

@@ -13,6 +13,7 @@ import os
 import shutil
 import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -71,26 +72,109 @@ def _prepare_embedding_dataframe(dataframe: Any) -> Any:
     return dataframe.filter("review_text IS NOT NULL").select(*EMBEDDING_COLUMNS)
 
 
-def _load_embedding_rows_with_arrow(input_path: Path) -> list[dict[str, object]]:
+def _resolve_positive_int_env(name: str, default: int) -> int:
+    raw_value = os.getenv(name, str(default)).strip()
+    try:
+        return max(1, int(raw_value))
+    except ValueError:
+        return default
+
+
+def _normalize_embedding_row(raw_row: dict[str, object]) -> dict[str, object]:
+    row = dict(raw_row)
+    for column in EMBEDDING_COLUMNS:
+        if column in row:
+            continue
+        if column == "aspect_count":
+            row[column] = 0
+        elif column == "sentiment_score":
+            row[column] = 0.0
+        else:
+            row[column] = ""
+    return row
+
+
+def _iter_embedding_batches_with_arrow(
+    input_path: Path,
+    *,
+    row_batch_size: int | None = None,
+) -> Iterator[list[dict[str, object]]]:
     dataset = ds.dataset(str(input_path), format="parquet")
     available_columns = set(dataset.schema.names)
     requested_columns = [column for column in EMBEDDING_COLUMNS if column in available_columns]
-    table = dataset.to_table(columns=requested_columns)
+    resolved_batch_size = row_batch_size or _resolve_positive_int_env("EMBEDDING_ROW_BATCH_SIZE", 5000)
 
+    for record_batch in dataset.to_batches(
+        columns=requested_columns,
+        batch_size=resolved_batch_size,
+    ):
+        rows = [
+            _normalize_embedding_row(dict(raw_row))
+            for raw_row in record_batch.to_pylist()
+        ]
+        if rows:
+            yield rows
+
+
+def _load_embedding_rows_with_arrow(input_path: Path) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
-    for raw_row in table.to_pylist():
-        row = dict(raw_row)
-        for column in EMBEDDING_COLUMNS:
-            if column in row:
-                continue
-            if column == "aspect_count":
-                row[column] = 0
-            elif column == "sentiment_score":
-                row[column] = 0.0
-            else:
-                row[column] = ""
-        rows.append(row)
+    for batch_rows in _iter_embedding_batches_with_arrow(input_path):
+        rows.extend(batch_rows)
     return rows
+
+
+def _build_chroma_payload(row: dict[str, object]) -> tuple[str, str, dict[str, object]] | None:
+    review_id = str(row.get("review_id", "") or "").strip()
+    review_text = str(row.get("review_text", "") or "")
+    if not review_id or len(review_text.strip()) < 20:
+        return None
+
+    metadata = {
+        "source": str(row.get("source", "") or ""),
+        "product_name": str(row.get("product_name", "") or ""),
+        "product_category": str(row.get("product_category", "") or ""),
+        "display_name": str(row.get("display_name", "") or ""),
+        "display_category": str(row.get("display_category", "") or ""),
+        "entity_type": str(row.get("entity_type", "") or ""),
+        "aspect_labels": str(row.get("aspect_labels", "") or ""),
+        "aspect_count": int(row.get("aspect_count", 0) or 0),
+        "sentiment_label": str(row.get("sentiment_label", "") or ""),
+        "sentiment_score": float(row.get("sentiment_score", 0.0) or 0.0),
+        "review_date": str(row.get("review_date", "") or ""),
+        "source_url": str(row.get("source_url", "") or ""),
+    }
+    return review_id, review_text, metadata
+
+
+def _upsert_embedding_payloads(
+    collection: Any,
+    embedding_backend: Any,
+    payloads: list[tuple[str, str, dict[str, object]]],
+    *,
+    encode_batch_size: int,
+    chroma_batch_size: int,
+) -> int:
+    if not payloads:
+        return 0
+
+    ids = [payload[0] for payload in payloads]
+    documents = [payload[1] for payload in payloads]
+    metadatas = [payload[2] for payload in payloads]
+    embeddings = encode_texts(
+        embedding_backend,
+        documents,
+        batch_size=encode_batch_size,
+        show_progress_bar=False,
+    )
+
+    for index in range(0, len(documents), chroma_batch_size):
+        collection.upsert(
+            ids=ids[index:index + chroma_batch_size],
+            documents=documents[index:index + chroma_batch_size],
+            embeddings=embeddings[index:index + chroma_batch_size],
+            metadatas=metadatas[index:index + chroma_batch_size],
+        )
+    return len(documents)
 
 
 def main() -> None:
@@ -131,8 +215,76 @@ def main() -> None:
         )
         raise RuntimeError("Sentiment parquet not found. Run sentiment scoring first.")
 
-    rows = _load_embedding_rows_with_arrow(settings.sentiment_parquet_path)
-    if not rows:
+    embedding_backend = load_embedding_backend(
+        model_name=os.getenv("EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
+    )
+    row_batch_size = _resolve_positive_int_env("EMBEDDING_ROW_BATCH_SIZE", 5000)
+    encode_batch_size = _resolve_positive_int_env("EMBEDDING_ENCODE_BATCH_SIZE", 64)
+    chroma_batch_size = _resolve_positive_int_env("CHROMA_ADD_BATCH_SIZE", 500)
+
+    log_event(
+        logger,
+        "embeddings_generation_started",
+        stage=run_context.stage,
+        run_id=run_context.run_id,
+        dag_id=run_context.dag_id,
+        task_id=run_context.task_id,
+        input_path=str(settings.sentiment_parquet_path),
+        row_batch_size=row_batch_size,
+        encode_batch_size=encode_batch_size,
+        chroma_batch_size=chroma_batch_size,
+        status="started",
+        embedding_backend=embedding_backend.backend_name,
+        embedding_model=embedding_backend.model_name,
+        embedding_fallback_reason=embedding_backend.fallback_reason,
+    )
+
+    if settings.chroma_path.exists():
+        shutil.rmtree(settings.chroma_path)
+
+    chromadb = _require_chromadb()
+    client = chromadb.PersistentClient(path=str(settings.chroma_path))
+    collection = client.get_or_create_collection(
+        name=os.getenv("CHROMA_COLLECTION_NAME", "reviewpulse_reviews")
+    )
+
+    total_input_rows = 0
+    total_embedded_rows = 0
+    last_logged_rows = 0
+    progress_interval = _resolve_positive_int_env("EMBEDDING_PROGRESS_INTERVAL_ROWS", 50000)
+    for rows in _iter_embedding_batches_with_arrow(
+        settings.sentiment_parquet_path,
+        row_batch_size=row_batch_size,
+    ):
+        total_input_rows += len(rows)
+        payloads = [
+            payload
+            for row in rows
+            if (payload := _build_chroma_payload(row)) is not None
+        ]
+        total_embedded_rows += _upsert_embedding_payloads(
+            collection,
+            embedding_backend,
+            payloads,
+            encode_batch_size=encode_batch_size,
+            chroma_batch_size=chroma_batch_size,
+        )
+
+        if total_embedded_rows - last_logged_rows >= progress_interval:
+            last_logged_rows = total_embedded_rows
+            log_event(
+                logger,
+                "embeddings_generation_progress",
+                stage=run_context.stage,
+                run_id=run_context.run_id,
+                dag_id=run_context.dag_id,
+                task_id=run_context.task_id,
+                input_rows_seen=total_input_rows,
+                embedded_rows=total_embedded_rows,
+                status="running",
+            )
+
+    if total_input_rows == 0:
         log_event(
             logger,
             "embeddings_generation_failed",
@@ -146,78 +298,8 @@ def main() -> None:
             error_message="No rows found for embedding.",
         )
         raise RuntimeError("No rows found for embedding.")
-
-    documents: list[str] = []
-    ids: list[str] = []
-    metadatas: list[dict[str, object]] = []
-    for row in rows:
-        review_text = str(row.get("review_text", "") or "")
-        if len(review_text.strip()) < 20:
-            continue
-
-        ids.append(str(row.get("review_id", "")))
-        documents.append(review_text)
-        metadatas.append(
-            {
-                "source": str(row.get("source", "") or ""),
-                "product_name": str(row.get("product_name", "") or ""),
-                "product_category": str(row.get("product_category", "") or ""),
-                "display_name": str(row.get("display_name", "") or ""),
-                "display_category": str(row.get("display_category", "") or ""),
-                "entity_type": str(row.get("entity_type", "") or ""),
-                "aspect_labels": str(row.get("aspect_labels", "") or ""),
-                "aspect_count": int(row.get("aspect_count", 0) or 0),
-                "sentiment_label": str(row.get("sentiment_label", "") or ""),
-                "sentiment_score": float(row.get("sentiment_score", 0.0) or 0.0),
-                "review_date": str(row.get("review_date", "") or ""),
-                "source_url": str(row.get("source_url", "") or ""),
-            }
-        )
-
-    if not documents:
+    if total_embedded_rows == 0:
         raise RuntimeError("No sufficiently long review_text values were found for embedding.")
-
-    embedding_backend = load_embedding_backend(
-        model_name=os.getenv("EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
-    )
-
-    log_event(
-        logger,
-        "embeddings_generation_started",
-        stage=run_context.stage,
-        run_id=run_context.run_id,
-        dag_id=run_context.dag_id,
-        task_id=run_context.task_id,
-        record_count=len(documents),
-        status="started",
-        embedding_backend=embedding_backend.backend_name,
-        embedding_model=embedding_backend.model_name,
-        embedding_fallback_reason=embedding_backend.fallback_reason,
-    )
-    embeddings = encode_texts(
-        embedding_backend,
-        documents,
-        batch_size=64,
-        show_progress_bar=embedding_backend.backend_name == "sentence-transformers",
-    )
-
-    if settings.chroma_path.exists():
-        shutil.rmtree(settings.chroma_path)
-
-    chromadb = _require_chromadb()
-    client = chromadb.PersistentClient(path=str(settings.chroma_path))
-    collection = client.get_or_create_collection(
-        name=os.getenv("CHROMA_COLLECTION_NAME", "reviewpulse_reviews")
-    )
-
-    batch_size = 500
-    for index in range(0, len(documents), batch_size):
-        collection.add(
-            ids=ids[index:index + batch_size],
-            documents=documents[index:index + batch_size],
-            embeddings=embeddings[index:index + batch_size],
-            metadatas=metadatas[index:index + batch_size],
-        )
 
     write_embedding_backend_metadata(settings.chroma_path, embedding_backend)
 
@@ -274,7 +356,8 @@ def main() -> None:
         run_id=run_context.run_id,
         dag_id=run_context.dag_id,
         task_id=run_context.task_id,
-        record_count=len(documents),
+        record_count=total_embedded_rows,
+        input_record_count=total_input_rows,
         output_path=str(settings.chroma_path),
         duration_ms=round((time.perf_counter() - started_at) * 1000, 2),
         status="success",

@@ -120,7 +120,9 @@ def _build_source_task_specs(settings: Settings) -> list[TaskSpec]:
             )
         )
 
-    if settings.ebay_app_id and settings.ebay_cert_id and settings.ebay_search_queries:
+    if settings.ebay_app_id and settings.ebay_cert_id and (
+        settings.ebay_search_queries or settings.ebay_category_ids
+    ):
         specs.append(
             TaskSpec(
                 task_id="ingest_ebay",

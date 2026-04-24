@@ -43,6 +43,61 @@ def resolve_video_ids(values: Iterable[str]) -> tuple[str, ...]:
     if not normalized:
         raise RuntimeError("YOUTUBE_VIDEO_IDS must include at least one valid video ID or URL.")
     return tuple(normalized)
+
+
+def search_video_ids(
+    query: str,
+    *,
+    api_key: str,
+    max_results: int,
+    session: requests.Session | None = None,
+) -> list[str]:
+    if not api_key:
+        raise RuntimeError("YOUTUBE_API_KEY must be configured when YOUTUBE_SEARCH_QUERIES is used.")
+    if max_results <= 0:
+        raise RuntimeError("YOUTUBE_MAX_VIDEOS_PER_QUERY must be greater than zero.")
+
+    active_session = session or requests.Session()
+    response = active_session.get(
+        "https://www.googleapis.com/youtube/v3/search",
+        params={
+            "part": "snippet",
+            "q": query,
+            "type": "video",
+            "maxResults": min(max_results, 50),
+            "key": api_key,
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    video_ids: list[str] = []
+    for item in payload.get("items") or []:
+        item_id = item.get("id") or {}
+        video_id = str(item_id.get("videoId") or "").strip()
+        if video_id:
+            video_ids.append(video_id)
+    return video_ids
+
+
+def resolve_configured_video_ids(
+    settings: Settings,
+    *,
+    session: requests.Session | None = None,
+) -> tuple[str, ...]:
+    raw_video_ids: list[str] = list(settings.youtube_video_ids)
+    if settings.youtube_search_queries:
+        active_session = session or requests.Session()
+        for query in settings.youtube_search_queries:
+            raw_video_ids.extend(
+                search_video_ids(
+                    query,
+                    api_key=settings.youtube_api_key,
+                    max_results=settings.youtube_max_videos_per_query,
+                    session=active_session,
+                )
+            )
+    return resolve_video_ids(raw_video_ids)
  
  
 def fetch_transcript_segments(video_id: str, languages: tuple[str, ...]) -> list[dict[str, Any]]:
@@ -157,7 +212,8 @@ def run(
     log_event(logger, "pipeline_run_started", **run_context.as_log_fields(), status="started")
  
     try:
-        video_ids = resolve_video_ids(settings.youtube_video_ids)
+        active_session = session or requests.Session()
+        video_ids = resolve_configured_video_ids(settings, session=active_session)
         log_event(
             logger,
             "source_fetch_started",
@@ -165,7 +221,6 @@ def run(
             record_count=len(video_ids),
             status="started",
         )
-        active_session = session or requests.Session()
         records: list[dict[str, Any]] = []
  
         for video_id in video_ids:

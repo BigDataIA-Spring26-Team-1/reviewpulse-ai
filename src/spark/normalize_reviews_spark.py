@@ -94,12 +94,10 @@ from src.normalization.core import (
     EBAY_FILE_CANDIDATES,
     IFIXIT_FILE_CANDIDATES,
     REDDIT_FILE_CANDIDATES,
-    YELP_BUSINESS_FILE_CANDIDATES,
-    YELP_REVIEW_FILE_CANDIDATES,
     YOUTUBE_FILE_CANDIDATES,
-    find_first_existing_path,
     resolve_source_input_path,
     resolve_yelp_source_paths,
+    stage_s3_raw_current_sources,
 )
 
 
@@ -285,23 +283,57 @@ def normalize_ebay(spark: Any) -> tuple[Any | None, Path | None]:
     if df is None:
         return None, None
 
+    item_id = coalesce(_optional_column(df, "item_id", cast_type="string"), lit("unknown"))
+    title = coalesce(
+        _optional_column(df, "title", cast_type="string"),
+        _optional_column(df, "item_title", cast_type="string"),
+        item_id,
+    )
+    category = coalesce(
+        _optional_column(df, "category", cast_type="string"),
+        _optional_column(df, "primary_category", cast_type="string"),
+        lit("unknown"),
+    )
+    review_text = coalesce(
+        _optional_column(df, "feedback_text", cast_type="string"),
+        _optional_column(df, "review_text", cast_type="string"),
+        lit(""),
+    )
+    review_date = to_timestamp(
+        coalesce(
+            _optional_column(df, "listing_date", cast_type="string"),
+            _optional_column(df, "review_date", cast_type="string"),
+        )
+    )
+    reviewer_id = coalesce(
+        _optional_column(df, "seller_id", cast_type="string"),
+        _optional_column(df, "seller", cast_type="string"),
+        _optional_column(df, "reviewer_id", cast_type="string"),
+        lit("unknown"),
+    )
+    helpful_votes = coalesce(
+        _optional_column(df, "feedback_count", cast_type="int"),
+        _optional_column(df, "helpful_votes", cast_type="int"),
+    )
+    url_column = _optional_column(df, "url", cast_type="string")
+
     ebay_df = df.select(
-        concat_ws("_", lit("ebay"), coalesce(col("item_id"), lit("unknown"))).alias("review_id"),
-        coalesce(col("title"), col("item_title"), col("item_id")).alias("product_name"),
-        coalesce(col("category"), col("primary_category"), lit("unknown")).alias("product_category"),
+        concat_ws("_", lit("ebay"), item_id).alias("review_id"),
+        title.alias("product_name"),
+        category.alias("product_category"),
         lit("ebay").alias("source"),
         _scale_column("seller_rating", 0.0, 100.0).alias("rating_normalized"),
-        coalesce(col("feedback_text"), col("review_text"), lit("")).alias("review_text"),
-        to_timestamp(coalesce(col("listing_date"), col("review_date"))).alias("review_date"),
-        coalesce(col("seller_id"), col("seller"), col("reviewer_id"), lit("unknown")).alias("reviewer_id"),
+        review_text.alias("review_text"),
+        review_date.alias("review_date"),
+        reviewer_id.alias("reviewer_id"),
         lit(None).cast("boolean").alias("verified_purchase"),
-        coalesce(col("feedback_count"), col("helpful_votes")).cast("int").alias("helpful_votes"),
+        helpful_votes.alias("helpful_votes"),
         when(
-            col("url").isNotNull() & (trim(col("url")) != ""),
-            col("url"),
-        ).otherwise(concat_ws("", lit("https://www.ebay.com/itm/"), col("item_id"))).alias("source_url"),
-        coalesce(col("title"), col("item_title"), col("item_id")).alias("display_name"),
-        coalesce(col("category"), col("primary_category"), lit("Marketplace Listing")).alias("display_category"),
+            url_column.isNotNull() & (trim(url_column) != ""),
+            url_column,
+        ).otherwise(concat_ws("", lit("https://www.ebay.com/itm/"), item_id)).alias("source_url"),
+        title.alias("display_name"),
+        coalesce(category, lit("Marketplace Listing")).alias("display_category"),
         lit("listing_review").alias("entity_type"),
     )
     return ebay_df, path
@@ -384,22 +416,39 @@ def normalize_youtube(spark: Any) -> tuple[Any | None, Path | None]:
     if df is None:
         return None, None
 
+    source_id = coalesce(
+        _optional_column(df, "source_id", cast_type="string"),
+        _optional_column(df, "video_id", cast_type="string"),
+        lit("unknown"),
+    )
+    review_text = coalesce(
+        _optional_column(df, "text", cast_type="string"),
+        _optional_column(df, "transcript", cast_type="string"),
+        lit(""),
+    )
+    review_date = coalesce(
+        to_timestamp(_optional_column(df, "published_date", cast_type="string")),
+        to_timestamp(from_unixtime(_optional_column(df, "created_utc", cast_type="bigint"))),
+    )
+    reviewer_id = coalesce(
+        _optional_column(df, "channel", cast_type="string"),
+        _optional_column(df, "channel_id", cast_type="string"),
+        lit("unknown"),
+    )
+
     youtube_df = df.select(
-        concat_ws("_", lit("youtube"), coalesce(col("source_id"), col("video_id"), lit("unknown"))).alias("review_id"),
-        coalesce(col("product_name"), lit("unknown")).alias("product_name"),
-        coalesce(col("product_category"), lit("unknown")).alias("product_category"),
+        concat_ws("_", lit("youtube"), source_id).alias("review_id"),
+        coalesce(_optional_column(df, "product_name", cast_type="string"), lit("unknown")).alias("product_name"),
+        coalesce(_optional_column(df, "product_category", cast_type="string"), lit("unknown")).alias("product_category"),
         lit("youtube").alias("source"),
         lit(None).cast(DoubleType()).alias("rating_normalized"),
-        coalesce(col("text"), col("transcript"), lit("")).alias("review_text"),
-        coalesce(
-            to_timestamp(col("published_date")),
-            to_timestamp(from_unixtime(col("created_utc").cast("bigint"))),
-        ).alias("review_date"),
-        coalesce(col("channel"), col("channel_id"), lit("unknown")).alias("reviewer_id"),
+        review_text.alias("review_text"),
+        review_date.alias("review_date"),
+        reviewer_id.alias("reviewer_id"),
         lit(None).cast("boolean").alias("verified_purchase"),
-        col("like_count").cast("int").alias("helpful_votes"),
-        coalesce(col("url"), lit("")).alias("source_url"),
-        coalesce(col("title"), lit("YouTube Review")).alias("display_name"),
+        _optional_column(df, "like_count", cast_type="int").alias("helpful_votes"),
+        coalesce(_optional_column(df, "url", cast_type="string"), lit("")).alias("source_url"),
+        coalesce(_optional_column(df, "title", cast_type="string"), lit("YouTube Review")).alias("display_name"),
         lit("Video Review").alias("display_category"),
         lit("video_transcript").alias("entity_type"),
     )
@@ -611,6 +660,12 @@ def main() -> None:
     run_context = build_run_context(stage="normalize_reviews_spark")
     started_at = time.perf_counter()
     storage_manager = S3StorageManager.from_settings(settings)
+    stage_s3_raw_current_sources(
+        settings=settings,
+        storage_manager=storage_manager,
+        logger=logger,
+        run_context=run_context,
+    )
     spark = build_spark()
 
     log_event(

@@ -172,6 +172,12 @@ def lexicon_score_text(text: str | None) -> tuple[str, float]:
 def load_sentiment_backend(model_name: str | None = None) -> SentimentBackend:
     selected_model = (model_name or os.getenv("SENTIMENT_MODEL", DEFAULT_SENTIMENT_MODEL)).strip()
     selected_model = selected_model or DEFAULT_SENTIMENT_MODEL
+    if selected_model.lower() in {"lexicon", "rule-based", "rule_based"}:
+        return SentimentBackend(
+            model=LexiconSentimentModel(),
+            backend_name="lexicon",
+            model_name="lexicon",
+        )
 
     try:
         available, probe_reason = _probe_transformers_import()
