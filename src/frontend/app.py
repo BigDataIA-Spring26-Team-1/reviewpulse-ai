@@ -96,6 +96,8 @@ def inject_theme() -> None:
             background:
                 linear-gradient(135deg, rgba(244, 247, 246, 0.96), rgba(238, 248, 245, 0.92) 48%, rgba(255, 247, 237, 0.92));
             color: var(--rp-ink);
+            font-size: 16px;
+            line-height: 1.55;
         }
 
         [data-testid="stSidebar"] {
@@ -126,12 +128,120 @@ def inject_theme() -> None:
             letter-spacing: 0;
         }
 
+        [data-testid="stMain"] {
+            color: var(--rp-ink);
+        }
+
+        [data-testid="stMain"] p,
+        [data-testid="stMain"] li,
+        [data-testid="stMain"] label,
+        [data-testid="stMain"] [data-testid="stMarkdownContainer"],
+        [data-testid="stMain"] [data-testid="stWidgetLabel"],
+        [data-testid="stMain"] [data-testid="stWidgetLabel"] p {
+            color: var(--rp-ink) !important;
+        }
+
+        [data-testid="stMain"] [data-testid="stWidgetLabel"] p {
+            font-size: 0.92rem;
+            font-weight: 750;
+        }
+
+        [data-testid="stMain"] [data-testid="stExpander"] {
+            background: rgba(255, 255, 255, 0.9);
+            border: 1px solid var(--rp-line);
+            border-radius: 8px;
+            color: var(--rp-ink);
+        }
+
+        [data-testid="stMain"] [data-testid="stExpander"] details > summary {
+            background: #ffffff;
+            border-radius: 8px;
+            min-height: 3rem;
+        }
+
+        [data-testid="stMain"] [data-testid="stExpander"] details > summary p {
+            color: var(--rp-ink) !important;
+            font-weight: 800;
+        }
+
+        [data-testid="stMain"] .stTextInput input,
+        [data-testid="stMain"] .stTextArea textarea,
+        [data-testid="stMain"] .stNumberInput input,
+        [data-testid="stMain"] div[data-baseweb="select"] > div {
+            background: #ffffff !important;
+            border: 1px solid #94a3b8 !important;
+            color: var(--rp-ink) !important;
+            box-shadow: none !important;
+        }
+
+        [data-testid="stMain"] .stTextInput input,
+        [data-testid="stMain"] .stTextArea textarea,
+        [data-testid="stMain"] .stNumberInput input {
+            font-size: 1rem;
+            min-height: 2.9rem;
+        }
+
+        [data-testid="stMain"] .stTextInput input::placeholder,
+        [data-testid="stMain"] .stTextArea textarea::placeholder {
+            color: #64748b !important;
+            opacity: 1 !important;
+        }
+
+        [data-testid="stMain"] div[data-baseweb="select"] span,
+        [data-testid="stMain"] div[data-baseweb="select"] svg {
+            color: var(--rp-ink) !important;
+            fill: #475569 !important;
+        }
+
+        div[data-baseweb="popover"] div[role="listbox"],
+        div[data-baseweb="popover"] div[role="option"] {
+            background: #ffffff !important;
+            color: var(--rp-ink) !important;
+        }
+
         div[data-testid="stButton"] > button,
         div[data-testid="stFormSubmitButton"] > button,
         div[data-testid="stLinkButton"] > a {
             border-radius: 8px;
             border: 1px solid rgba(15, 118, 110, 0.18);
             font-weight: 700;
+        }
+
+        [data-testid="stMain"] div[data-testid="stButton"] > button,
+        [data-testid="stMain"] div[data-testid="stLinkButton"] > a {
+            background: #ffffff;
+            border-color: #94a3b8;
+            color: var(--rp-ink);
+            min-height: 2.75rem;
+        }
+
+        [data-testid="stMain"] div[data-testid="stButton"] > button:hover,
+        [data-testid="stMain"] div[data-testid="stLinkButton"] > a:hover {
+            background: #eef8f5;
+            border-color: var(--rp-teal);
+            color: var(--rp-ink);
+        }
+
+        [data-testid="stMain"] button[data-testid="stBaseButton-primary"],
+        [data-testid="stMain"] div[data-testid="stFormSubmitButton"] > button {
+            background: var(--rp-teal) !important;
+            border-color: var(--rp-teal) !important;
+            color: #ffffff !important;
+        }
+
+        [data-testid="stMain"] button[data-testid="stBaseButton-primary"]:hover,
+        [data-testid="stMain"] div[data-testid="stFormSubmitButton"] > button:hover {
+            background: #115e59 !important;
+            border-color: #115e59 !important;
+            color: #ffffff !important;
+        }
+
+        [data-testid="stMain"] div[data-testid="stButton"] > button:disabled,
+        [data-testid="stMain"] div[data-testid="stFormSubmitButton"] > button:disabled {
+            background: #dce6e4 !important;
+            border-color: #c5d4d1 !important;
+            color: #40515a !important;
+            opacity: 1 !important;
         }
 
         div[data-testid="stFormSubmitButton"] > button {
