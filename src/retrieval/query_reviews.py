@@ -7,12 +7,26 @@ Run:
 
 from __future__ import annotations
 
+# ruff: noqa: E402
+
 import os
+import sys
+from pathlib import Path
 
 import chromadb
 
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from src.common.settings import get_settings
-from src.retrieval.embedding_backend import encode_texts, load_embedding_backend
+from src.retrieval.embedding_backend import (
+    DEFAULT_EMBEDDING_MODEL,
+    encode_texts,
+    load_embedding_backend,
+)
+from src.retrieval.sqlite_vector_store import SQLiteReviewVectorStore, sqlite_store_exists
 
 
 def main() -> None:
@@ -27,17 +41,25 @@ def main() -> None:
         print("Run build_embeddings.py first.")
         return
 
-    model_name = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+    model_name = os.getenv("EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
     embedding_backend = load_embedding_backend(
         chroma_path=settings.chroma_path,
         model_name=model_name,
     )
-    print(f"Loading embedding backend: {embedding_backend.backend_name} ({embedding_backend.model_name})")
-
-    client = chromadb.PersistentClient(path=str(settings.chroma_path))
-    collection = client.get_collection(
-        name=os.getenv("CHROMA_COLLECTION_NAME", "reviewpulse_reviews")
+    print(
+        "Loading embedding backend: "
+        f"{embedding_backend.backend_name} ({embedding_backend.model_name})"
     )
+
+    if sqlite_store_exists(settings.chroma_path):
+        sqlite_store = SQLiteReviewVectorStore(settings.chroma_path)
+        collection = None
+    else:
+        sqlite_store = None
+        client = chromadb.PersistentClient(path=str(settings.chroma_path))
+        collection = client.get_collection(
+            name=os.getenv("CHROMA_COLLECTION_NAME", "reviewpulse_reviews")
+        )
 
     while True:
         query = input("\nEnter a query (or type 'exit'): ").strip()
@@ -46,21 +68,26 @@ def main() -> None:
         if not query:
             continue
 
-        query_embedding = encode_texts(
-            embedding_backend,
-            [query],
-            batch_size=1,
-            show_progress_bar=False,
-        )[0]
-        results = collection.query(
-            query_embeddings=[query_embedding],
-            n_results=5,
-            include=["documents", "metadatas", "distances"],
-        )
+        if sqlite_store is not None:
+            search_results = sqlite_store.search(
+                query=query,
+                embedding_backend=embedding_backend,
+                n_results=5,
+            )
+            documents = [item["review_text"] for item in search_results]
+            metadatas = [item for item in search_results]
+            distances = [item["distance"] for item in search_results]
+        else:
+            query_embedding = encode_texts(embedding_backend, [query])[0]
+            results = collection.query(
+                query_embeddings=[query_embedding],
+                n_results=5,
+                include=["documents", "metadatas", "distances"],
+            )
 
-        documents = results.get("documents", [[]])[0]
-        metadatas = results.get("metadatas", [[]])[0]
-        distances = results.get("distances", [[]])[0]
+            documents = results.get("documents", [[]])[0]
+            metadatas = results.get("metadatas", [[]])[0]
+            distances = results.get("distances", [[]])[0]
 
         print("\nTop results:\n")
         for index, (document, metadata, distance) in enumerate(
@@ -84,6 +111,9 @@ def main() -> None:
             print(f"  URL: {metadata.get('source_url', '')}")
             print(f"  Text: {document[:400]}...")
             print("-" * 60)
+
+    if sqlite_store is not None:
+        sqlite_store.close()
 
 
 if __name__ == "__main__":
