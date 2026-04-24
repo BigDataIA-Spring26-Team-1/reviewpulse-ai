@@ -73,9 +73,25 @@ class Settings:
     sentiment_parquet_path: Path
     chroma_path: Path
     aws_region: str
+    aws_access_key_id: str
+    aws_secret_access_key: str
+    aws_session_token: str
     s3_bucket_name: str
     s3_raw_prefix: str
     s3_processed_prefix: str
+    snowflake_account: str
+    snowflake_user: str
+    snowflake_password: str
+    snowflake_role: str
+    snowflake_warehouse: str
+    snowflake_database: str
+    snowflake_schema: str
+    snowflake_storage_integration: str
+    snowflake_stage: str
+    snowflake_file_format: str
+    snowflake_normalized_table: str
+    snowflake_sentiment_table: str
+    snowflake_truncate_before_load: bool
     spark_master: str
     spark_sql_session_timezone: str
     sentiment_model: str
@@ -110,6 +126,18 @@ class Settings:
     @property
     def s3_enabled(self) -> bool:
         return bool(self.s3_bucket_name.strip())
+
+    @property
+    def snowflake_enabled(self) -> bool:
+        required_values = (
+            self.snowflake_account,
+            self.snowflake_user,
+            self.snowflake_password,
+            self.snowflake_warehouse,
+            self.snowflake_database,
+            self.snowflake_schema,
+        )
+        return all(value.strip() for value in required_values)
 
     @property
     def yelp_dataset_source(self) -> str | Path | None:
@@ -162,9 +190,25 @@ def get_settings() -> Settings:
         sentiment_parquet_path=sentiment_parquet_path,
         chroma_path=chroma_path,
         aws_region=os.getenv("AWS_REGION", "us-east-1"),
+        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID", "").strip(),
+        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY", "").strip(),
+        aws_session_token=os.getenv("AWS_SESSION_TOKEN", "").strip(),
         s3_bucket_name=os.getenv("S3_BUCKET_NAME", "").strip(),
         s3_raw_prefix=os.getenv("S3_RAW_PREFIX", "raw"),
         s3_processed_prefix=os.getenv("S3_PROCESSED_PREFIX", "processed"),
+        snowflake_account=os.getenv("SNOWFLAKE_ACCOUNT", "").strip(),
+        snowflake_user=os.getenv("SNOWFLAKE_USER", "").strip(),
+        snowflake_password=os.getenv("SNOWFLAKE_PASSWORD", "").strip(),
+        snowflake_role=os.getenv("SNOWFLAKE_ROLE", "").strip(),
+        snowflake_warehouse=os.getenv("SNOWFLAKE_WAREHOUSE", "").strip(),
+        snowflake_database=os.getenv("SNOWFLAKE_DATABASE", "").strip(),
+        snowflake_schema=os.getenv("SNOWFLAKE_SCHEMA", "").strip(),
+        snowflake_storage_integration=os.getenv("SNOWFLAKE_STORAGE_INTEGRATION", "").strip(),
+        snowflake_stage=os.getenv("SNOWFLAKE_STAGE", "REVIEWPULSE_S3_STAGE").strip(),
+        snowflake_file_format=os.getenv("SNOWFLAKE_FILE_FORMAT", "REVIEWPULSE_PARQUET_FORMAT").strip(),
+        snowflake_normalized_table=os.getenv("SNOWFLAKE_NORMALIZED_TABLE", "NORMALIZED_REVIEWS").strip(),
+        snowflake_sentiment_table=os.getenv("SNOWFLAKE_SENTIMENT_TABLE", "REVIEWS_WITH_SENTIMENT").strip(),
+        snowflake_truncate_before_load=_bool_env("SNOWFLAKE_TRUNCATE_BEFORE_LOAD", True),
         spark_master=os.getenv("SPARK_MASTER", "local[*]"),
         spark_sql_session_timezone=os.getenv("SPARK_SQL_SESSION_TIMEZONE", "UTC"),
         sentiment_model=os.getenv(

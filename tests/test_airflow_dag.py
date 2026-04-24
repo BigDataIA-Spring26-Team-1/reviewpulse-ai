@@ -122,6 +122,7 @@ def test_build_dag_wires_all_enabled_source_tasks(monkeypatch):
             "ingest_ifixit",
             "ingest_yelp",
             "ingest_youtube",
+            "load_snowflake",
             "normalize_local_preview",
             "normalize_reviews_spark",
             "run_tests",
@@ -138,7 +139,8 @@ def test_build_dag_wires_all_enabled_source_tasks(monkeypatch):
         }
         assert airflow_dag.task_dict["normalize_reviews_spark"].upstream_task_ids == {"normalize_local_preview"}
         assert airflow_dag.task_dict["score_sentiment"].upstream_task_ids == {"normalize_reviews_spark"}
-        assert airflow_dag.task_dict["build_embeddings"].upstream_task_ids == {"score_sentiment"}
+        assert airflow_dag.task_dict["load_snowflake"].upstream_task_ids == {"score_sentiment"}
+        assert airflow_dag.task_dict["build_embeddings"].upstream_task_ids == {"load_snowflake"}
         assert airflow_dag.task_dict["run_tests"].upstream_task_ids == {"build_embeddings"}
         assert airflow_dag.task_dict["ingest_ebay"].bash_command.endswith(
             "poetry run python -m src.ingestion.ebay"
@@ -152,24 +154,32 @@ def test_build_dag_wires_all_enabled_source_tasks(monkeypatch):
 
 
 def test_reprocessing_dag_wires_processing_chain(monkeypatch):
-    monkeypatch.setattr(dag_reprocessing, "_load_airflow_objects", lambda: (FakeDAG, FakeBashOperator))
+    workspace = make_workspace("airflow_reprocessing_dag")
+    try:
+        settings = build_test_settings(workspace)
+        monkeypatch.setattr(dag_reprocessing, "_load_airflow_objects", lambda: (FakeDAG, FakeBashOperator))
+        monkeypatch.setattr(dag_reprocessing, "get_settings", lambda: settings)
 
-    airflow_dag = dag_reprocessing._build_dag()
+        airflow_dag = dag_reprocessing._build_dag()
 
-    assert airflow_dag.kwargs["dag_id"] == "reviewpulse_reprocess_pipeline"
-    assert airflow_dag.kwargs["schedule"] is None
-    assert sorted(airflow_dag.task_dict) == [
-        "build_embeddings",
-        "normalize_local_preview",
-        "normalize_reviews_spark",
-        "run_tests",
-        "score_sentiment",
-    ]
-    assert airflow_dag.task_dict["normalize_local_preview"].upstream_task_ids == set()
-    assert airflow_dag.task_dict["normalize_reviews_spark"].upstream_task_ids == {"normalize_local_preview"}
-    assert airflow_dag.task_dict["score_sentiment"].upstream_task_ids == {"normalize_reviews_spark"}
-    assert airflow_dag.task_dict["build_embeddings"].upstream_task_ids == {"score_sentiment"}
-    assert airflow_dag.task_dict["run_tests"].upstream_task_ids == {"build_embeddings"}
-    assert airflow_dag.task_dict["run_tests"].bash_command.endswith(
-        "poetry run python -m pytest tests/test_normalization.py -v"
-    )
+        assert airflow_dag.kwargs["dag_id"] == "reviewpulse_reprocess_pipeline"
+        assert airflow_dag.kwargs["schedule"] is None
+        assert sorted(airflow_dag.task_dict) == [
+            "build_embeddings",
+            "load_snowflake",
+            "normalize_local_preview",
+            "normalize_reviews_spark",
+            "run_tests",
+            "score_sentiment",
+        ]
+        assert airflow_dag.task_dict["normalize_local_preview"].upstream_task_ids == set()
+        assert airflow_dag.task_dict["normalize_reviews_spark"].upstream_task_ids == {"normalize_local_preview"}
+        assert airflow_dag.task_dict["score_sentiment"].upstream_task_ids == {"normalize_reviews_spark"}
+        assert airflow_dag.task_dict["load_snowflake"].upstream_task_ids == {"score_sentiment"}
+        assert airflow_dag.task_dict["build_embeddings"].upstream_task_ids == {"load_snowflake"}
+        assert airflow_dag.task_dict["run_tests"].upstream_task_ids == {"build_embeddings"}
+        assert airflow_dag.task_dict["run_tests"].bash_command.endswith(
+            "poetry run python -m pytest tests/test_normalization.py -v"
+        )
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
