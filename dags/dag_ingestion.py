@@ -6,8 +6,9 @@ This DAG runs the checked-in pipeline stages in order:
 2. Validate and normalize raw source data into a shared JSONL preview.
 3. Run the Spark normalization job for the core sources.
 4. Score sentiment.
-5. Build embeddings.
-6. Run tests.
+5. Load Snowflake when configured.
+6. Build embeddings.
+7. Run tests.
 """
 
 from __future__ import annotations
@@ -39,6 +40,7 @@ Task Flow:
         -> normalize_local_preview
         -> normalize_reviews_spark
         -> score_sentiment
+        -> load_snowflake (when configured)
         -> build_embeddings
         -> run_tests
 """
@@ -149,8 +151,8 @@ def _build_source_task_specs(settings: Settings) -> list[TaskSpec]:
     return specs
 
 
-def _build_processing_task_specs() -> list[TaskSpec]:
-    return [
+def _build_processing_task_specs(settings: Settings | None = None) -> list[TaskSpec]:
+    specs = [
         TaskSpec(
             task_id="normalize_local_preview",
             bash_command=_module_command("src.normalization.core"),
@@ -163,25 +165,38 @@ def _build_processing_task_specs() -> list[TaskSpec]:
             task_id="score_sentiment",
             bash_command=_module_command("src.ml.sentiment_scoring"),
         ),
-        TaskSpec(
-            task_id="build_embeddings",
-            bash_command=_module_command("src.retrieval.build_embeddings"),
-        ),
-        TaskSpec(
-            task_id="run_tests",
-            bash_command=(
-                f"cd {PROJECT_ROOT_POSIX} && "
-                "poetry run python -m pytest tests/test_normalization.py -v"
-            ),
-        ),
     ]
+    if settings is not None and settings.s3_enabled and settings.snowflake_enabled:
+        specs.append(
+            TaskSpec(
+                task_id="load_snowflake",
+                bash_command=_module_command("src.warehouse.snowflake_loader --dataset all"),
+            )
+        )
+
+    specs.extend(
+        [
+            TaskSpec(
+                task_id="build_embeddings",
+                bash_command=_module_command("src.retrieval.build_embeddings"),
+            ),
+            TaskSpec(
+                task_id="run_tests",
+                bash_command=(
+                    f"cd {PROJECT_ROOT_POSIX} && "
+                    "poetry run python -m pytest tests/test_normalization.py -v"
+                ),
+            ),
+        ]
+    )
+    return specs
 
 
 def _build_dag() -> Any:
     DAG, BashOperator = _load_airflow_objects()
     project_settings = get_settings()
     source_task_specs = _build_source_task_specs(project_settings)
-    processing_task_specs = _build_processing_task_specs()
+    processing_task_specs = _build_processing_task_specs(project_settings)
 
     default_args = {
         "owner": "reviewpulse",

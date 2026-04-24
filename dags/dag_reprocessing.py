@@ -6,8 +6,9 @@ rebuilding normalized and downstream artifacts:
 1. Rebuild the unified local JSONL preview from the latest raw files.
 2. Rebuild Spark normalized parquet output.
 3. Recompute sentiment labels and scores.
-4. Rebuild embeddings.
-5. Re-run normalization tests.
+4. Load Snowflake when configured.
+5. Rebuild embeddings.
+6. Re-run normalization tests.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from dags.dag_ingestion import (
     _log_airflow_task_failed,
     _log_airflow_task_started,
 )
+from src.common.settings import get_settings
 from src.common.structured_logging import configure_structured_logging, get_logger, log_event
 
 
@@ -34,6 +36,7 @@ Task Flow:
     normalize_local_preview
         -> normalize_reviews_spark
         -> score_sentiment
+        -> load_snowflake (when configured)
         -> build_embeddings
         -> run_tests
 """
@@ -41,7 +44,7 @@ Task Flow:
 
 def _build_dag() -> Any:
     DAG, BashOperator = _load_airflow_objects()
-    processing_task_specs = _build_processing_task_specs()
+    processing_task_specs = _build_processing_task_specs(get_settings())
 
     default_args = {
         "owner": "reviewpulse",
@@ -77,13 +80,8 @@ def _build_dag() -> Any:
                 on_failure_callback=_log_airflow_task_failed,
             )
 
-        (
-            processing_tasks["normalize_local_preview"]
-            >> processing_tasks["normalize_reviews_spark"]
-            >> processing_tasks["score_sentiment"]
-            >> processing_tasks["build_embeddings"]
-            >> processing_tasks["run_tests"]
-        )
+        for upstream_spec, downstream_spec in zip(processing_task_specs, processing_task_specs[1:]):
+            processing_tasks[upstream_spec.task_id] >> processing_tasks[downstream_spec.task_id]
 
     return airflow_dag
 

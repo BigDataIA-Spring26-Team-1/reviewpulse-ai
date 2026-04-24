@@ -31,11 +31,11 @@ The checked-in repository currently implements this flow:
 
 | Layer | Components |
 |-------|------------|
-| Data Sources | Amazon sample data, eBay POC pipeline, Yelp dataset, iFixit POC pipeline, YouTube transcripts, optional Reddit connector |
-| Raw / Intermediate Storage | Local files under `data/` |
+| Data Sources | Amazon Reviews 2023, eBay pipeline, Yelp dataset, iFixit pipeline, YouTube transcripts, optional Reddit connector |
+| Raw / Intermediate Storage | S3-backed raw/current prefixes plus local files under `data/` |
 | Processing | PySpark normalization, cleaning, and sentiment enrichment |
 | ML / NLP | Ollama aspect extraction POC, sentence-transformers embeddings, ChromaDB retrieval |
-| Structured / Vector Access | Local parquet files and ChromaDB |
+| Structured / Vector Access | Local parquet files, Snowflake warehouse tables, and ChromaDB |
 | Application Layer | FastAPI endpoints for health, stats, search, and grounded chat |
 | Frontend | Streamlit dashboard |
 
@@ -44,9 +44,10 @@ The checked-in repository currently implements this flow:
 ```text
 Amazon/eBay/Yelp/iFixit/YouTube/Reddit
     -> POC ingestion scripts and dataset loaders
-    -> local raw/intermediate files in data/
+    -> S3 raw/current prefixes and local staged files in data/
     -> Spark normalization and cleaning
     -> sentiment scoring parquet output
+    -> Snowflake normalized/sentiment tables
     -> embeddings + ChromaDB index
     -> FastAPI
     -> Streamlit
@@ -54,7 +55,7 @@ Amazon/eBay/Yelp/iFixit/YouTube/Reddit
 
 ### Note on the project diagrams
 
-The project diagrams describe a larger target architecture involving cloud storage, warehouses, and caches. The current repository runs locally and does not currently wire up BigQuery, Snowflake, Redis, S3, or Gemini in the checked-in application code.
+The repository now wires the core S3 data lake and Snowflake warehouse path. Redis, BigQuery, and Gemini remain optional/planned architecture components.
 
 ---
 
@@ -111,14 +112,15 @@ Normalization formulas:
 | Tool | Why This |
 |------|----------|
 | PySpark | Handles normalization and parquet processing consistently across larger datasets |
-| Local filesystem + parquet | Matches the current repository and keeps local setup simple |
+| S3 + local parquet | Stores run/current raw and processed artifacts while preserving local reruns |
+| Snowflake | Warehouse load target for normalized and sentiment parquet |
 | Ollama + Llama 3.1 | Free local option for aspect extraction POC |
 | Anthropic API (optional) | Improves grounded chat answers when configured |
 | sentence-transformers | Local embeddings for semantic retrieval |
 | ChromaDB | Persistent local vector store |
 | FastAPI | Simple typed API layer |
 | Streamlit | Fast Python-native dashboard |
-| Airflow | Planned orchestration target for a fuller pipeline |
+| Airflow | Pipeline orchestration DAGs |
 
 ---
 
@@ -147,8 +149,10 @@ reviewpulse-ai/
 |   |-- retrieval/
 |   |   |-- build_embeddings.py
 |   |   `-- query_reviews.py
-|   `-- spark/
-|       `-- normalize_reviews_spark.py
+|   |-- spark/
+|   |   `-- normalize_reviews_spark.py
+|   `-- warehouse/
+|       `-- snowflake_loader.py
 |-- tests/
 |-- data/
 |-- results/
@@ -179,6 +183,8 @@ cp .env.example .env
 
 Current variables in `.env.example`:
 - `ANTHROPIC_API_KEY` and `ANTHROPIC_MODEL` for optional LLM-backed `/chat` answers
+- `S3_BUCKET_NAME`, `S3_RAW_PREFIX`, and `S3_PROCESSED_PREFIX` for S3-backed pipeline artifacts
+- `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER`, `SNOWFLAKE_PASSWORD`, `SNOWFLAKE_WAREHOUSE`, `SNOWFLAKE_DATABASE`, and `SNOWFLAKE_SCHEMA` for warehouse loading
 - `YELP_DATASET_PATH` for a local Yelp Open Dataset directory, or `YELP_DATASET_S3_URI` for an S3 prefix containing the review and business JSON files
 - `OLLAMA_HOST` for `poc/aspect_extraction.py`
 - `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET`, and `REDDIT_USER_AGENT` for `poc/reddit_connector.py`
@@ -205,21 +211,24 @@ poetry run python poc/reddit_connector.py
 poetry run python poc/normalize_schema.py
 
 # Step 3: Build Spark parquet output
-poetry run python src/spark/normalize_reviews_spark.py
+poetry run python -m src.spark.normalize_reviews_spark
 
 # Step 4: Add sentiment labels and scores
-poetry run python src/ml/sentiment_scoring.py
+poetry run python -m src.ml.sentiment_scoring
 
-# Step 5: Build embeddings and ChromaDB index
-poetry run python src/retrieval/build_embeddings.py
+# Step 5: Load processed parquet into Snowflake when configured
+poetry run python -m src.warehouse.snowflake_loader --dataset all
 
-# Step 6: Run tests
+# Step 6: Build embeddings and ChromaDB index
+poetry run python -m src.retrieval.build_embeddings
+
+# Step 7: Run tests
 poetry run pytest tests/test_normalization.py -v
 
-# Step 7: Start FastAPI
+# Step 8: Start FastAPI
 poetry run uvicorn src.api.main:app --reload
 
-# Step 8: Start Streamlit in a new terminal
+# Step 9: Start Streamlit in a new terminal
 poetry run streamlit run src/frontend/app.py
 ```
 
@@ -306,7 +315,7 @@ What the LLM does not do:
 | Spark | PySpark local | Dataproc or managed Spark cluster |
 | LLM extraction | Ollama single machine | Multiple workers or batch API |
 | Vector store | ChromaDB local | Managed vector database |
-| Structured storage | Local parquet files | Cloud warehouse or lakehouse |
+| Structured storage | Local parquet files + Snowflake | Warehouse/lakehouse automation |
 | API | FastAPI localhost | Containerized deployment |
 | Frontend | Streamlit local | Streamlit Cloud or containerized deployment |
 
@@ -314,11 +323,10 @@ What the LLM does not do:
 
 ## Current Limitations
 
-- Amazon data in the current repository uses a sample subset, not the full 571M-review corpus
 - eBay and iFixit pipelines are still POC-oriented rather than production crawlers
 - Sentiment scoring is a lightweight baseline rather than a production classifier
 - Retrieval quality depends on source text and metadata quality
-- The larger cloud architecture from the project diagrams is not fully wired in this repository yet
+- Redis, BigQuery, Gemini, and HITL queues remain planned/stretch components
 
 ---
 
