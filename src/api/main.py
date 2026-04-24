@@ -547,22 +547,22 @@ def _retrieve_reviews_from_snowflake(query: str, source_filter: Optional[str] = 
             schema=settings.snowflake_schema,
             role=settings.snowflake_role or None,
         )
+        # Keywords are restricted to word chars only — safe to embed directly
         keywords = [w for w in re.sub(r"[^\w\s]", "", query.lower()).split() if len(w) > 3][:5]
         if not keywords:
-            keywords = [re.sub(r"[^\w\s]", "", query.lower()).strip()]
-        like_parts = " OR ".join(["LOWER(review_text) LIKE %s" for _ in keywords])
-        like_values = [f"%{kw}%" for kw in keywords]
-        source_clause = " AND LOWER(source) = %s" if source_filter else ""
-        params = like_values + ([source_filter.lower()] if source_filter else [])
+            keywords = [re.sub(r"[^\w\s]", "", query.lower()).strip() or "review"]
+        like_parts = " OR ".join([f'"review_text" ILIKE \'%{kw}%\'' for kw in keywords])
+        safe_source = re.sub(r"[^\w]", "", source_filter.lower()) if source_filter else ""
+        source_clause = f" AND \"source\" ILIKE '{safe_source}'" if safe_source else ""
         sql = f"""
-            SELECT review_id, review_text, source, product_name, product_category,
-                   display_name, display_category, entity_type, source_url, review_date
+            SELECT "review_id", "review_text", "source", "product_name", "product_category",
+                   "display_name", "display_category", "entity_type", "source_url", "review_date"
             FROM {settings.snowflake_normalized_table}
             WHERE ({like_parts}){source_clause}
-            LIMIT {n_results * 3}
+            LIMIT {n_results}
         """
         cur = conn.cursor()
-        cur.execute(sql, params)
+        cur.execute(sql)
         rows = cur.fetchall()
         columns = [desc[0].lower() for desc in cur.description]
         cur.close()
