@@ -15,9 +15,9 @@ from src.common.storage import S3PathResolver, S3StorageManager
 from src.common.structured_logging import configure_structured_logging
 from src.ingestion.amazon import build_dataset_config, run as run_amazon, stream_amazon_records
 from src.ingestion.common import count_lines
-from src.ingestion.ebay import map_item_summary, run as run_ebay
+from src.ingestion.ebay import fetch_category_items, map_item_summary, run as run_ebay
 from src.ingestion.ifixit import map_guide_payload
-from src.ingestion.youtube import build_record, resolve_video_ids
+from src.ingestion.youtube import build_record, resolve_configured_video_ids, resolve_video_ids
 from src.ingestion.yelp import (
     BUSINESS_FILENAME,
     REVIEW_FILENAME,
@@ -132,6 +132,17 @@ class FakeStatefulAmazonStream:
 
     def state_dict(self) -> dict[str, int]:
         return {"offset": self._position}
+
+
+class FakeJsonResponse:
+    def __init__(self, payload: dict[str, object]) -> None:
+        self.payload = payload
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict[str, object]:
+        return self.payload
 
 
 def test_build_dataset_config_normalizes_amazon_category():
@@ -569,13 +580,50 @@ def test_run_ebay_requires_queries():
     try:
         settings = replace(build_test_settings(workspace), ebay_search_queries=tuple())
 
-        with pytest.raises(RuntimeError, match="EBAY_SEARCH_QUERIES"):
+        with pytest.raises(RuntimeError, match="EBAY_SEARCH_QUERIES or EBAY_CATEGORY_IDS"):
             run_ebay(
                 settings=settings,
                 run_context=build_run_context(stage="ingest_ebay", source="ebay", run_id="run_test"),
                 logger=build_logger(),
                 storage_manager=build_storage_manager(),
             )
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
+def test_fetch_category_items_uses_category_filter():
+    workspace = make_workspace("fetch_ebay_category")
+    try:
+        settings = build_test_settings(workspace)
+
+        class FakeSession:
+            def __init__(self) -> None:
+                self.params: list[dict[str, object]] = []
+
+            def get(self, *_args, params=None, **_kwargs):
+                self.params.append(dict(params or {}))
+                return FakeJsonResponse(
+                    {
+                        "itemSummaries": [
+                            {
+                                "itemId": "v1|123|0",
+                                "title": "Headphones",
+                                "seller": {"username": "seller1", "feedbackPercentage": "99.5"},
+                            }
+                        ]
+                    }
+                )
+
+        session = FakeSession()
+        records = fetch_category_items(
+            "15032",
+            access_token="token",
+            settings=settings,
+            session=session,
+        )
+
+        assert session.params[0]["category_ids"] == "15032"
+        assert records[0]["search_query"] == "category:15032"
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
 
@@ -620,3 +668,39 @@ def test_build_record_uses_real_transcript_segments():
     assert record["segment_count"] == 2
     assert record["duration_seconds"] == 7.0
     assert "Battery life is strong" in record["text"]
+
+
+def test_resolve_configured_video_ids_uses_youtube_search_queries():
+    workspace = make_workspace("youtube_search_queries")
+    try:
+        settings = replace(
+            build_test_settings(workspace),
+            youtube_video_ids=tuple(),
+            youtube_search_queries=("sony xm5 review",),
+            youtube_api_key="api-key",
+            youtube_max_videos_per_query=2,
+        )
+
+        class FakeSession:
+            def __init__(self) -> None:
+                self.params: list[dict[str, object]] = []
+
+            def get(self, *_args, params=None, **_kwargs):
+                self.params.append(dict(params or {}))
+                return FakeJsonResponse(
+                    {
+                        "items": [
+                            {"id": {"videoId": "abcdefghijk"}},
+                            {"id": {"videoId": "lmnopqrstuv"}},
+                        ]
+                    }
+                )
+
+        session = FakeSession()
+        video_ids = resolve_configured_video_ids(settings, session=session)
+
+        assert video_ids == ("abcdefghijk", "lmnopqrstuv")
+        assert session.params[0]["q"] == "sony xm5 review"
+        assert session.params[0]["key"] == "api-key"
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)

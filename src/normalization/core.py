@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -39,23 +40,32 @@ YELP_BUSINESS_FILE_CANDIDATES = (
 )
 EBAY_FILE_CANDIDATES = (
     "ebay_reviews.jsonl",
+    "ebay/current/ebay_reviews.jsonl",
     "ebay/ebay_reviews.jsonl",
+    "ebay/current/ebay_listings.jsonl",
     "ebay/ebay_listings.jsonl",
+    "ebay/current/listings.jsonl",
     "ebay/listings.jsonl",
 )
 IFIXIT_FILE_CANDIDATES = (
     "ifixit_reviews.jsonl",
+    "ifixit/current/ifixit_reviews.jsonl",
     "ifixit/ifixit_reviews.jsonl",
+    "ifixit/current/ifixit_guides.jsonl",
     "ifixit/ifixit_guides.jsonl",
+    "ifixit/current/guides.jsonl",
     "ifixit/guides.jsonl",
 )
 YOUTUBE_FILE_CANDIDATES = (
     "youtube_reviews.jsonl",
+    "youtube/current/youtube_reviews.jsonl",
     "youtube/youtube_reviews.jsonl",
+    "youtube/current/youtube_transcripts.jsonl",
     "youtube/youtube_transcripts.jsonl",
 )
 REDDIT_FILE_CANDIDATES = (
     "reddit_reviews.jsonl",
+    "reddit/current/reddit_reviews.jsonl",
     "reddit/reddit_reviews.jsonl",
 )
 
@@ -577,6 +587,81 @@ def _average(values: Sequence[float]) -> float:
     return sum(values) / len(values)
 
 
+def stage_s3_raw_current_sources(
+    *,
+    settings: Any | None = None,
+    storage_manager: S3StorageManager | None = None,
+    logger: logging.Logger | None = None,
+    run_context: PipelineRunContext | None = None,
+    sources: Sequence[str] = (*PROPOSAL_CORE_SOURCES, *OPTIONAL_SOURCES),
+) -> dict[str, list[Path]]:
+    resolved_settings = settings or get_settings()
+    if not resolved_settings.s3_enabled:
+        return {}
+    should_stage = os.getenv("REVIEWPULSE_STAGE_S3_RAW", "1").strip().lower()
+    if should_stage in {"0", "false", "no", "off"}:
+        return {}
+
+    resolved_storage_manager = storage_manager or S3StorageManager.from_settings(resolved_settings)
+    resolved_logger = logger or get_logger("normalization.s3_staging")
+    resolved_run_context = run_context or build_run_context(stage="stage_s3_raw_current")
+
+    staged: dict[str, list[Path]] = {}
+    for source_name in sources:
+        source_prefix = resolved_storage_manager.resolver.raw_current_prefix(source_name)
+        local_dir = (resolved_settings.data_dir / source_name / "current").resolve()
+        log_event(
+            resolved_logger,
+            "s3_raw_stage_started",
+            source=source_name,
+            stage=resolved_run_context.stage,
+            run_id=resolved_run_context.run_id,
+            dag_id=resolved_run_context.dag_id,
+            task_id=resolved_run_context.task_id,
+            input_path=source_prefix,
+            output_path=str(local_dir),
+            status="started",
+        )
+        downloaded_paths = resolved_storage_manager.download_prefix(
+            source_prefix,
+            local_dir,
+            clear_destination=True,
+            exclude_latest_marker=True,
+        )
+        if not downloaded_paths:
+            log_event(
+                resolved_logger,
+                "s3_raw_stage_skipped",
+                source=source_name,
+                stage=resolved_run_context.stage,
+                run_id=resolved_run_context.run_id,
+                dag_id=resolved_run_context.dag_id,
+                task_id=resolved_run_context.task_id,
+                input_path=source_prefix,
+                output_path=str(local_dir),
+                file_count=0,
+                status="skipped",
+            )
+            continue
+
+        staged[source_name] = downloaded_paths
+        log_event(
+            resolved_logger,
+            "s3_raw_stage_completed",
+            source=source_name,
+            stage=resolved_run_context.stage,
+            run_id=resolved_run_context.run_id,
+            dag_id=resolved_run_context.dag_id,
+            task_id=resolved_run_context.task_id,
+            input_path=source_prefix,
+            output_path=str(local_dir),
+            file_count=len(downloaded_paths),
+            status="success",
+        )
+
+    return staged
+
+
 def _upload_raw_snapshot(
     storage_manager: S3StorageManager,
     logger: logging.Logger,
@@ -674,6 +759,7 @@ def run_local_normalization(
     run_context: PipelineRunContext | None = None,
     logger: logging.Logger | None = None,
     storage_manager: S3StorageManager | None = None,
+    publish_raw_snapshots: bool = False,
 ) -> list[dict[str, Any]]:
     settings = get_settings()
     run_context = run_context or build_run_context(stage="normalize_local_preview")
@@ -693,6 +779,18 @@ def run_local_normalization(
         dag_id=run_context.dag_id,
         task_id=run_context.task_id,
         status="started",
+    )
+
+    stage_s3_raw_current_sources(
+        settings=settings,
+        storage_manager=storage_manager,
+        logger=logger,
+        run_context=run_context,
+        sources=(
+            (*PROPOSAL_CORE_SOURCES, *OPTIONAL_SOURCES)
+            if include_optional_sources
+            else PROPOSAL_CORE_SOURCES
+        ),
     )
 
     amazon_path = resolve_source_input_path(settings.data_dir, "amazon", AMAZON_FILE_CANDIDATES)
@@ -882,9 +980,10 @@ def run_local_normalization(
         )
         raise RuntimeError("No real input source files were available for normalization.")
 
-    for source_name, source_path in available_sources:
-        _upload_raw_snapshot(storage_manager, logger, run_context, source_name, source_path)
-        raw_sources_for_promotion.append(source_name)
+    if publish_raw_snapshots:
+        for source_name, source_path in available_sources:
+            _upload_raw_snapshot(storage_manager, logger, run_context, source_name, source_path)
+            raw_sources_for_promotion.append(source_name)
 
     _write_jsonl(settings.normalized_jsonl_path, normalized_records)
     _publish_normalized_output(storage_manager, logger, run_context, settings.normalized_jsonl_path)

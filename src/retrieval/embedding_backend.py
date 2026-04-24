@@ -69,6 +69,18 @@ def _fallback_dimensions() -> int:
         return DEFAULT_FALLBACK_DIMENSIONS
 
 
+def _parse_hashing_model_dimensions(model_name: str) -> int:
+    lowered = model_name.strip().lower()
+    if lowered in {"hashing", "hash"}:
+        return _fallback_dimensions()
+    if lowered.startswith("hashing-"):
+        try:
+            return max(16, int(lowered.removeprefix("hashing-")))
+        except ValueError:
+            return _fallback_dimensions()
+    return _fallback_dimensions()
+
+
 def _metadata_path(chroma_path: Path) -> Path:
     return chroma_path / BACKEND_METADATA_FILENAME
 
@@ -135,6 +147,13 @@ def load_embedding_backend(
         if metadata and metadata.get("model_name")
         else os.getenv("EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
     )
+    if selected_model.strip().lower() in {"hashing", "hash"} or selected_model.strip().lower().startswith("hashing-"):
+        dimensions = _parse_hashing_model_dimensions(selected_model)
+        return EmbeddingBackend(
+            model=HashingEmbeddingModel(dimensions),
+            backend_name="hashing",
+            model_name=f"hashing-{dimensions}",
+        )
 
     try:
         available, probe_reason = _probe_sentence_transformers_import()

@@ -8,6 +8,8 @@ Run:
 from __future__ import annotations
 
 import logging
+import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -42,13 +44,29 @@ def _read_parquet_rows_with_arrow(input_path: Path) -> list[dict[str, object]]:
 
 def _write_parquet_rows_with_arrow(rows: list[dict[str, object]], output_path: Path) -> None:
     if output_path.exists():
-        import shutil
-
         shutil.rmtree(output_path)
 
     output_path.mkdir(parents=True, exist_ok=True)
     table = pa.Table.from_pylist(rows)
     pq.write_table(table, output_path / "part-00000.parquet", compression="snappy")
+
+
+def _env_flag_enabled(name: str, default: bool) -> bool:
+    raw_value = os.getenv(name, "").strip().lower()
+    if not raw_value:
+        return default
+    return raw_value not in {"0", "false", "no", "off"}
+
+
+def _aspect_backend_mode() -> str:
+    return os.getenv("ASPECT_EXTRACTION_BACKEND", "heuristic").strip().lower() or "heuristic"
+
+
+def _should_probe_ollama_aspects() -> bool:
+    return _env_flag_enabled("ASPECT_EXTRACTION_ENABLED", True) and _aspect_backend_mode() in {
+        "auto",
+        "ollama",
+    }
 
 
 def _extract_aspects_for_text(
@@ -81,11 +99,13 @@ def _score_sentiment_with_arrow(
     ollama_host: str | None = None,
     ollama_model: str | None = None,
     ollama_timeout_seconds: int | None = None,
+    row_batch_size: int | None = None,
 ) -> int:
-    rows = _read_parquet_rows_with_arrow(input_path)
-    if not rows:
-        _write_parquet_rows_with_arrow([], output_path)
-        return 0
+    dataset = ds.dataset(str(input_path), format="parquet")
+    resolved_batch_size = int(row_batch_size or os.getenv("SENTIMENT_ROW_BATCH_SIZE", "50000"))
+    resolved_batch_size = max(1, resolved_batch_size)
+    aspect_enabled = _env_flag_enabled("ASPECT_EXTRACTION_ENABLED", True)
+    aspect_backend = _aspect_backend_mode()
 
     backend = sentiment_backend or load_sentiment_backend(
         sentiment_model_name or DEFAULT_SENTIMENT_MODEL
@@ -94,38 +114,64 @@ def _score_sentiment_with_arrow(
     resolved_ollama_model = str(ollama_model or "llama3.1:8b")
     resolved_ollama_timeout = int(ollama_timeout_seconds or 30)
     should_use_ollama = (
-        probe_ollama_host(resolved_ollama_host, resolved_ollama_timeout)
+        aspect_backend in {"auto", "ollama"}
+        and probe_ollama_host(resolved_ollama_host, resolved_ollama_timeout)
         if ollama_available is None
-        else ollama_available
+        else aspect_backend in {"auto", "ollama"} and ollama_available
     )
 
-    sentiment_scores = score_texts(
-        backend,
-        [str(row.get("review_text", "") or "") for row in rows],
-    )
+    if output_path.exists():
+        shutil.rmtree(output_path)
+    output_path.mkdir(parents=True, exist_ok=True)
 
-    enriched_rows: list[dict[str, object]] = []
-    for row, (sentiment_label, sentiment_score) in zip(rows, sentiment_scores):
-        review_text = str(row.get("review_text", "") or "")
-        aspects = _extract_aspects_for_text(
-            review_text,
-            ollama_available=should_use_ollama,
-            ollama_host=resolved_ollama_host,
-            ollama_model=resolved_ollama_model,
-            ollama_timeout_seconds=resolved_ollama_timeout,
+    total_rows = 0
+    part_index = 0
+    for record_batch in dataset.to_batches(batch_size=resolved_batch_size):
+        rows = pa.Table.from_batches([record_batch]).to_pylist()
+        if not rows:
+            continue
+
+        sentiment_scores = score_texts(
+            backend,
+            [str(row.get("review_text", "") or "") for row in rows],
         )
-        aspect_labels, aspect_count, aspect_details_json = serialize_aspects(aspects)
 
-        enriched_row = dict(row)
-        enriched_row["aspect_labels"] = aspect_labels
-        enriched_row["aspect_count"] = int(aspect_count)
-        enriched_row["aspect_details_json"] = aspect_details_json
-        enriched_row["sentiment_label"] = sentiment_label
-        enriched_row["sentiment_score"] = float(sentiment_score)
-        enriched_rows.append(enriched_row)
+        enriched_rows: list[dict[str, object]] = []
+        for row, (sentiment_label, sentiment_score) in zip(rows, sentiment_scores):
+            review_text = str(row.get("review_text", "") or "")
+            aspects = (
+                _extract_aspects_for_text(
+                    review_text,
+                    ollama_available=should_use_ollama,
+                    ollama_host=resolved_ollama_host,
+                    ollama_model=resolved_ollama_model,
+                    ollama_timeout_seconds=resolved_ollama_timeout,
+                )
+                if aspect_enabled
+                else []
+            )
+            aspect_labels, aspect_count, aspect_details_json = serialize_aspects(aspects)
 
-    _write_parquet_rows_with_arrow(enriched_rows, output_path)
-    return len(enriched_rows)
+            enriched_row = dict(row)
+            enriched_row["aspect_labels"] = aspect_labels
+            enriched_row["aspect_count"] = int(aspect_count)
+            enriched_row["aspect_details_json"] = aspect_details_json
+            enriched_row["sentiment_label"] = sentiment_label
+            enriched_row["sentiment_score"] = float(sentiment_score)
+            enriched_rows.append(enriched_row)
+
+        table = pa.Table.from_pylist(enriched_rows)
+        pq.write_table(
+            table,
+            output_path / f"part-{part_index:05d}.parquet",
+            compression="snappy",
+        )
+        total_rows += len(enriched_rows)
+        part_index += 1
+
+    if total_rows == 0:
+        _write_parquet_rows_with_arrow([], output_path)
+    return total_rows
 
 
 def main() -> None:
@@ -167,9 +213,18 @@ def main() -> None:
         raise RuntimeError("Normalized parquet not found. Run the Spark normalization pipeline first.")
 
     sentiment_backend = load_sentiment_backend(settings.sentiment_model)
-    ollama_available = probe_ollama_host(
-        settings.ollama_host,
-        settings.ollama_timeout_seconds,
+    ollama_available = (
+        probe_ollama_host(
+            settings.ollama_host,
+            settings.ollama_timeout_seconds,
+        )
+        if _should_probe_ollama_aspects()
+        else False
+    )
+    aspect_backend = (
+        "disabled"
+        if not _env_flag_enabled("ASPECT_EXTRACTION_ENABLED", True)
+        else "ollama" if ollama_available else "heuristic"
     )
 
     log_event(
@@ -184,7 +239,7 @@ def main() -> None:
         sentiment_backend=sentiment_backend.backend_name,
         sentiment_model=sentiment_backend.model_name,
         sentiment_fallback_reason=sentiment_backend.fallback_reason,
-        aspect_backend="ollama" if ollama_available else "heuristic",
+        aspect_backend=aspect_backend,
     )
 
     enriched_count = _score_sentiment_with_arrow(
@@ -255,7 +310,7 @@ def main() -> None:
         duration_ms=round((time.perf_counter() - started_at) * 1000, 2),
         status="success",
         sentiment_backend=sentiment_backend.backend_name,
-        aspect_backend="ollama" if ollama_available else "heuristic",
+        aspect_backend=aspect_backend,
     )
 
 

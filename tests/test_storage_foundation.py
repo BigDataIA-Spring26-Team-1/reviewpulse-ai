@@ -157,6 +157,58 @@ def test_download_file_fetches_s3_object_to_local_path():
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+def test_download_prefix_syncs_relative_files_and_skips_latest_marker():
+    resolver = S3PathResolver(bucket="reviewpulse-bucket", raw_prefix="raw", processed_prefix="processed")
+    client = FakeS3Client()
+    manager = S3StorageManager(resolver, client)
+
+    temp_dir = Path(__file__).resolve().parent / "_tmp_storage_prefix_download"
+    shutil.rmtree(temp_dir, ignore_errors=True)
+    try:
+        client.objects[("reviewpulse-bucket", "raw/amazon/current/_LATEST_RUN.json")] = b"{}"
+        client.objects[("reviewpulse-bucket", "raw/amazon/current/batch_1.jsonl")] = b'{"id":1}\n'
+        client.objects[("reviewpulse-bucket", "raw/amazon/current/nested/batch_2.jsonl")] = b'{"id":2}\n'
+
+        downloaded = manager.download_prefix(
+            "s3://reviewpulse-bucket/raw/amazon/current/",
+            temp_dir,
+            clear_destination=True,
+        )
+
+        assert sorted(path.relative_to(temp_dir).as_posix() for path in downloaded) == [
+            "batch_1.jsonl",
+            "nested/batch_2.jsonl",
+        ]
+        assert (temp_dir / "batch_1.jsonl").read_text(encoding="utf-8") == '{"id":1}\n'
+        assert not (temp_dir / "_LATEST_RUN.json").exists()
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_download_prefix_does_not_clear_destination_when_prefix_is_empty():
+    resolver = S3PathResolver(bucket="reviewpulse-bucket", raw_prefix="raw", processed_prefix="processed")
+    client = FakeS3Client()
+    manager = S3StorageManager(resolver, client)
+
+    temp_dir = Path(__file__).resolve().parent / "_tmp_storage_empty_prefix"
+    shutil.rmtree(temp_dir, ignore_errors=True)
+    try:
+        temp_dir.mkdir(parents=True)
+        stale_file = temp_dir / "local_only.jsonl"
+        stale_file.write_text('{"id": "local"}\n', encoding="utf-8")
+
+        downloaded = manager.download_prefix(
+            "s3://reviewpulse-bucket/raw/missing/current/",
+            temp_dir,
+            clear_destination=True,
+        )
+
+        assert downloaded == []
+        assert stale_file.exists()
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 def test_count_lines_streams_s3_object():
     resolver = S3PathResolver(bucket="reviewpulse-bucket", raw_prefix="raw", processed_prefix="processed")
     client = FakeS3Client()

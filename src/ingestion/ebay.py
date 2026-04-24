@@ -87,6 +87,39 @@ def fetch_query_items(
     settings: Settings,
     session: requests.Session | None = None,
 ) -> list[dict[str, Any]]:
+    return _fetch_items(
+        {"q": query},
+        result_label=query,
+        access_token=access_token,
+        settings=settings,
+        session=session,
+    )
+
+
+def fetch_category_items(
+    category_id: str,
+    *,
+    access_token: str,
+    settings: Settings,
+    session: requests.Session | None = None,
+) -> list[dict[str, Any]]:
+    return _fetch_items(
+        {"category_ids": category_id},
+        result_label=f"category:{category_id}",
+        access_token=access_token,
+        settings=settings,
+        session=session,
+    )
+
+
+def _fetch_items(
+    base_params: dict[str, str],
+    *,
+    result_label: str,
+    access_token: str,
+    settings: Settings,
+    session: requests.Session | None = None,
+) -> list[dict[str, Any]]:
     if settings.ebay_max_items_per_query <= 0:
         raise RuntimeError("EBAY_MAX_ITEMS_PER_QUERY must be greater than zero.")
 
@@ -104,7 +137,7 @@ def fetch_query_items(
                 "X-EBAY-C-MARKETPLACE-ID": settings.ebay_marketplace_id,
             },
             params={
-                "q": query,
+                **base_params,
                 "limit": page_size,
                 "offset": offset,
             },
@@ -121,7 +154,7 @@ def fetch_query_items(
             if not item_id or item_id in seen_ids:
                 continue
             seen_ids.add(item_id)
-            records.append(map_item_summary(item, query))
+            records.append(map_item_summary(item, result_label))
             if len(records) >= settings.ebay_max_items_per_query:
                 break
 
@@ -149,8 +182,8 @@ def run(
     log_event(logger, "pipeline_run_started", **run_context.as_log_fields(), status="started")
 
     try:
-        if not settings.ebay_search_queries:
-            raise RuntimeError("EBAY_SEARCH_QUERIES must be configured for eBay ingestion.")
+        if not settings.ebay_search_queries and not settings.ebay_category_ids:
+            raise RuntimeError("EBAY_SEARCH_QUERIES or EBAY_CATEGORY_IDS must be configured for eBay ingestion.")
         log_event(
             logger,
             "source_fetch_started",
@@ -180,6 +213,28 @@ def run(
                 input_path=query,
                 record_count=len(query_records),
                 duration_ms=round((time.perf_counter() - query_started_at) * 1000, 2),
+                status="success",
+            )
+
+        for category_id in settings.ebay_category_ids:
+            category_started_at = time.perf_counter()
+            category_records = fetch_category_items(
+                category_id,
+                access_token=access_token,
+                settings=settings,
+                session=active_session,
+            )
+            for record in category_records:
+                item_id = str(record.get("item_id") or "").strip()
+                if item_id and item_id not in records_by_id:
+                    records_by_id[item_id] = record
+            log_event(
+                logger,
+                "source_fetch_completed",
+                **run_context.as_log_fields(),
+                input_path=f"category:{category_id}",
+                record_count=len(category_records),
+                duration_ms=round((time.perf_counter() - category_started_at) * 1000, 2),
                 status="success",
             )
 

@@ -12,7 +12,15 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.ml.sentiment_backend import LexiconSentimentModel, SentimentBackend, load_sentiment_backend
 from src.ml.sentiment_scoring import _score_sentiment_with_arrow
+
+
+def test_load_sentiment_backend_can_force_lexicon():
+    backend = load_sentiment_backend("lexicon")
+
+    assert backend.backend_name == "lexicon"
+    assert backend.model_name == "lexicon"
 
 
 def test_score_sentiment_with_arrow_writes_scored_parquet(tmp_path: Path):
@@ -32,10 +40,23 @@ def test_score_sentiment_with_arrow_writes_scored_parquet(tmp_path: Path):
     )
     pq.write_table(source_table, input_path / "part-00000.parquet", compression="snappy")
 
-    record_count = _score_sentiment_with_arrow(input_path, output_path)
+    backend = SentimentBackend(
+        model=LexiconSentimentModel(),
+        backend_name="lexicon",
+        model_name="lexicon",
+    )
+    record_count = _score_sentiment_with_arrow(
+        input_path,
+        output_path,
+        sentiment_backend=backend,
+        ollama_available=False,
+        row_batch_size=1,
+    )
 
-    written = pq.read_table(output_path / "part-00000.parquet").to_pylist()
+    written_parts = sorted(output_path.glob("*.parquet"))
+    written = pq.read_table(output_path).to_pylist()
     assert record_count == 2
+    assert len(written_parts) == 2
     assert written[0]["sentiment_label"] == "positive"
     assert written[1]["sentiment_label"] == "negative"
     assert "sentiment_score" in written[0]
