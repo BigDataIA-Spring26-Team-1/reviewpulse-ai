@@ -13,7 +13,10 @@ import os
 import re
 import sys
 from collections import Counter
+<<<<<<< HEAD
 from functools import lru_cache
+=======
+>>>>>>> 2feac8497b1b0ebd59798af410a2cbb616d914dc
 from pathlib import Path
 from typing import Any, Optional
 
@@ -114,12 +117,16 @@ def get_spark() -> SparkSession:
     )
 
 
+<<<<<<< HEAD
 @lru_cache(maxsize=1)
+=======
+>>>>>>> 2feac8497b1b0ebd59798af410a2cbb616d914dc
 def get_embedding_backend():
     return load_embedding_backend(
         chroma_path=settings.chroma_path,
         model_name=EMBEDDING_MODEL,
     )
+<<<<<<< HEAD
 
 
 def encode_query_text(query: str) -> list[float]:
@@ -129,6 +136,8 @@ def encode_query_text(query: str) -> list[float]:
         batch_size=1,
         show_progress_bar=False,
     )[0]
+=======
+>>>>>>> 2feac8497b1b0ebd59798af410a2cbb616d914dc
 
 
 def get_collection():
@@ -290,11 +299,15 @@ def retrieve_reviews(query: str, source_filter: Optional[str] = None, n_results:
     if not os.path.exists(CHROMA_DIR):
         return []
 
+<<<<<<< HEAD
     try:
         embedding_backend = get_embedding_backend()
     except Exception:
         return []
 
+=======
+    embedding_backend = get_embedding_backend()
+>>>>>>> 2feac8497b1b0ebd59798af410a2cbb616d914dc
     if sqlite_store_exists(settings.chroma_path):
         store = SQLiteReviewVectorStore(settings.chroma_path)
         try:
@@ -316,6 +329,7 @@ def retrieve_reviews(query: str, source_filter: Optional[str] = None, n_results:
             for item in results
         ]
 
+<<<<<<< HEAD
     try:
         collection = get_collection()
         query_embedding = encode_texts(
@@ -326,6 +340,10 @@ def retrieve_reviews(query: str, source_filter: Optional[str] = None, n_results:
         )[0]
     except Exception:
         return []
+=======
+    collection = get_collection()
+    query_embedding = encode_texts(embedding_backend, [query])[0]
+>>>>>>> 2feac8497b1b0ebd59798af410a2cbb616d914dc
 
     where = {"source": source_filter.lower()} if source_filter else None
     results = collection.query(
