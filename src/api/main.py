@@ -533,9 +533,66 @@ def attach_product_labels(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return output
 
 
+def _retrieve_reviews_from_snowflake(query: str, source_filter: Optional[str] = None, n_results: int = 5) -> list[dict]:
+    if not settings.snowflake_enabled:
+        return []
+    try:
+        import snowflake.connector
+        conn = snowflake.connector.connect(
+            account=settings.snowflake_account,
+            user=settings.snowflake_user,
+            password=settings.snowflake_password,
+            warehouse=settings.snowflake_warehouse,
+            database=settings.snowflake_database,
+            schema=settings.snowflake_schema,
+            role=settings.snowflake_role or None,
+        )
+        keywords = [w for w in re.sub(r"[^\w\s]", "", query.lower()).split() if len(w) > 3][:5]
+        if not keywords:
+            keywords = [re.sub(r"[^\w\s]", "", query.lower()).strip()]
+        like_parts = " OR ".join(["LOWER(review_text) LIKE %s" for _ in keywords])
+        like_values = [f"%{kw}%" for kw in keywords]
+        source_clause = " AND LOWER(source) = %s" if source_filter else ""
+        params = like_values + ([source_filter.lower()] if source_filter else [])
+        sql = f"""
+            SELECT review_id, review_text, source, product_name, product_category,
+                   display_name, display_category, entity_type, source_url, review_date
+            FROM {settings.snowflake_normalized_table}
+            WHERE ({like_parts}){source_clause}
+            LIMIT {n_results * 3}
+        """
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+        columns = [desc[0].lower() for desc in cur.description]
+        cur.close()
+        conn.close()
+        results = []
+        for row in rows[:n_results]:
+            item = dict(zip(columns, row))
+            results.append({
+                "source": str(item.get("source", "")),
+                "product_name": str(item.get("product_name", "") or ""),
+                "product_category": str(item.get("product_category", "") or ""),
+                "display_name": clean_display_name(item),
+                "display_category": clean_display_category(item),
+                "entity_type": clean_entity_type(item),
+                "aspect_labels": "",
+                "aspect_count": 0,
+                "sentiment_label": "",
+                "sentiment_score": 0.0,
+                "source_url": str(item.get("source_url", "") or ""),
+                "distance": 0.5,
+                "review_text": str(item.get("review_text", "") or ""),
+            })
+        return attach_product_labels(results)
+    except Exception:
+        return []
+
+
 def retrieve_reviews(query: str, source_filter: Optional[str] = None, n_results: int = 5):
     if not settings.chroma_path.exists():
-        return []
+        return _retrieve_reviews_from_snowflake(query, source_filter, n_results)
 
     try:
         embedding_backend = get_embedding_backend()

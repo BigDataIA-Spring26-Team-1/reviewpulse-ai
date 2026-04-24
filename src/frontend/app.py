@@ -889,17 +889,17 @@ def render_sidebar() -> str:
     except Exception as error:
         st.sidebar.error(f"API offline: {error}")
 
-    if st.sidebar.button("Refresh API status", use_container_width=True):
+    if st.sidebar.button("Refresh API status", width="stretch"):
         resolve_api_base.clear()
         load_health.clear()
         load_detailed_health.clear()
         st.rerun()
 
-    st.sidebar.link_button("Swagger docs", f"{api_base}/docs", use_container_width=True)
-    st.sidebar.link_button("OpenAPI schema", f"{api_base}/openapi.json", use_container_width=True)
+    st.sidebar.link_button("Swagger docs", f"{api_base}/docs", width="stretch")
+    st.sidebar.link_button("OpenAPI schema", f"{api_base}/openapi.json", width="stretch")
 
     with st.sidebar.expander("Dependency health"):
-        if st.button("Check dependencies", use_container_width=True):
+        if st.button("Check dependencies", width="stretch"):
             load_detailed_health.clear()
             with st.spinner("Checking dependencies..."):
                 try:
@@ -933,7 +933,7 @@ def render_example_prompts() -> None:
     columns = st.columns(len(examples))
     for column, prompt in zip(columns, examples):
         with column:
-            if st.button(prompt, use_container_width=True):
+            if st.button(prompt, width="stretch"):
                 st.session_state["ask_query"] = prompt
                 st.rerun()
 
@@ -976,13 +976,13 @@ def render_dashboard_home() -> None:
             {"component": "Cache", "status": cache_label, "details": health.get("cache_disabled_reason") or ""},
             {"component": "Data freshness", "status": "available" if summary.get("latest_dataset_update") else "unknown", "details": summary.get("latest_dataset_update")},
         ]
-        st.dataframe(pd.DataFrame(status_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(status_rows), width="stretch", hide_index=True)
 
     with right:
         st.markdown('<div class="rp-section-title">Data Artifacts</div>', unsafe_allow_html=True)
         artifacts = pd.DataFrame(summary.get("artifact_dirs") or [])
         if not artifacts.empty:
-            st.dataframe(artifacts, use_container_width=True, hide_index=True)
+            st.dataframe(artifacts, width="stretch", hide_index=True)
         else:
             render_empty("No local data artifacts were found.")
 
@@ -1018,7 +1018,7 @@ def render_review_explorer() -> None:
             min_rating, max_rating = st.slider("Normalized rating", 0.0, 1.0, (0.0, 1.0), 0.05)
 
         offset = st.number_input("Offset", min_value=0, max_value=1000000, value=0, step=limit)
-        run_clicked = st.button("Search reviews", type="primary", use_container_width=True)
+        run_clicked = st.button("Search reviews", type="primary", width="stretch")
 
     if run_clicked:
         params = compact_params(
@@ -1073,7 +1073,7 @@ def render_review_explorer() -> None:
         "helpful_votes",
         "source_url",
     ]
-    st.dataframe(pd.DataFrame(rows)[table_cols], use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(rows)[table_cols], width="stretch", hide_index=True)
     for index, row in enumerate(rows[:10], start=1):
         render_review_card(row, index=index, label="Review", include_distance=False)
 
@@ -1090,7 +1090,7 @@ def render_sentiment_analytics_view() -> None:
         with cols[3]:
             category = st.text_input("Category contains", key="sent_category")
         query = st.text_input("Text/aspect filter", key="sent_query")
-        load_clicked = st.button("Load sentiment analytics", type="primary", use_container_width=True)
+        load_clicked = st.button("Load sentiment analytics", type="primary", width="stretch")
 
     if load_clicked:
         params = params_key(
@@ -1132,7 +1132,7 @@ def render_sentiment_analytics_view() -> None:
         df = pd.DataFrame(payload.get("sentiment_distribution") or [])
         if not df.empty:
             st.bar_chart(df.set_index("sentiment_label")[["count"]])
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.dataframe(df, width="stretch", hide_index=True)
         else:
             render_empty("No sentiment labels found for this filter.")
     with top_right:
@@ -1165,7 +1165,7 @@ def render_sentiment_analytics_view() -> None:
     df = pd.DataFrame(payload.get("top_aspects") or [])
     if not df.empty:
         st.bar_chart(df.set_index("aspect")[["count"]])
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.dataframe(df, width="stretch", hide_index=True)
     else:
         render_empty("No extracted aspects found for this filter.")
 
@@ -1174,7 +1174,7 @@ def render_product_comparison_view() -> None:
     st.session_state.setdefault("compare_manual_products", DEFAULT_COMPARE_PRODUCTS)
     st.session_state.setdefault("compare_product_choices", [])
 
-    if st.button("Load product options", use_container_width=True):
+    if st.button("Load product options", width="stretch"):
         with st.spinner("Loading product names..."):
             try:
                 options_payload = load_review_options()
@@ -1232,7 +1232,7 @@ def render_product_comparison_view() -> None:
     with cols[1]:
         category = st.text_input("Category contains", key="compare_category")
 
-    if st.button("Compare products", type="primary", use_container_width=True):
+    if st.button("Compare products", type="primary", width="stretch"):
         if not selected:
             st.warning("Choose or enter at least one product.")
             return
@@ -1291,7 +1291,7 @@ def render_product_comparison_view() -> None:
         }
         for row in rows
     ]
-    st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(summary_rows), width="stretch", hide_index=True)
     chart_df = pd.DataFrame(summary_rows).set_index("product_label")
     st.bar_chart(chart_df[["review_count"]])
 
@@ -1319,7 +1319,7 @@ def render_aspect_intelligence_view() -> None:
         category = st.text_input("Category contains", key="aspect_category")
     query = st.text_input("Text/aspect filter", key="aspect_query")
 
-    if st.button("Load aspect intelligence", type="primary", use_container_width=True):
+    if st.button("Load aspect intelligence", type="primary", width="stretch"):
         params = params_key(
             {
                 "source": source,
@@ -1359,7 +1359,7 @@ def render_aspect_intelligence_view() -> None:
         df = pd.DataFrame(payload.get("top_positive_aspects") or [])
         if not df.empty:
             st.bar_chart(df.set_index("aspect")[["positive_count"]])
-            st.dataframe(df[["aspect", "count", "positive_count", "average_sentiment_score"]], use_container_width=True, hide_index=True)
+            st.dataframe(df[["aspect", "count", "positive_count", "average_sentiment_score"]], width="stretch", hide_index=True)
         else:
             render_empty("No positive aspect data found.")
     with neg_col:
@@ -1367,14 +1367,14 @@ def render_aspect_intelligence_view() -> None:
         df = pd.DataFrame(payload.get("top_negative_aspects") or [])
         if not df.empty:
             st.bar_chart(df.set_index("aspect")[["negative_count"]])
-            st.dataframe(df[["aspect", "count", "negative_count", "average_sentiment_score"]], use_container_width=True, hide_index=True)
+            st.dataframe(df[["aspect", "count", "negative_count", "average_sentiment_score"]], width="stretch", hide_index=True)
         else:
             render_empty("No negative aspect data found.")
 
     st.markdown('<div class="rp-section-title">Aspect Breakdown</div>', unsafe_allow_html=True)
     df = pd.DataFrame(payload.get("aspects") or [])
     if not df.empty:
-        st.dataframe(df.drop(columns=["example"], errors="ignore"), use_container_width=True, hide_index=True)
+        st.dataframe(df.drop(columns=["example"], errors="ignore"), width="stretch", hide_index=True)
     else:
         render_empty("No aspect rows found.")
 
@@ -1397,7 +1397,7 @@ def render_ask_view() -> None:
         with control_middle:
             n_results = st.slider("Evidence", min_value=1, max_value=10, value=3)
         with control_right:
-            submit = st.form_submit_button("Ask ReviewPulse", use_container_width=True)
+            submit = st.form_submit_button("Ask ReviewPulse", width="stretch")
 
     if submit:
         if not query.strip():
@@ -1457,7 +1457,7 @@ def render_ask_view() -> None:
         guardrail = chat_response.get("guardrail") or {}
         can_load_search = guardrail.get("action") in {None, "allow"}
         if can_load_search and not result.get("search_loaded"):
-            if st.button("Load supporting reviews", use_container_width=True):
+            if st.button("Load supporting reviews", width="stretch"):
                 with st.spinner("Loading supporting reviews..."):
                     try:
                         search_results = run_search(
@@ -1484,7 +1484,7 @@ def render_ask_view() -> None:
 def render_source_overview() -> None:
     action_left, action_right = st.columns([1, 3])
     with action_left:
-        load_clicked = st.button("Load source stats", type="primary", use_container_width=True)
+        load_clicked = st.button("Load source stats", type="primary", width="stretch")
     with action_right:
         st.caption("First load scans the sentiment parquet dataset; later reruns use the app cache.")
 
@@ -1543,7 +1543,7 @@ def render_source_overview() -> None:
         if not df_counts.empty:
             df_counts = df_counts.sort_values("count", ascending=False)
             st.bar_chart(df_counts.set_index("source")[["count"]])
-            st.dataframe(df_counts, use_container_width=True, hide_index=True)
+            st.dataframe(df_counts, width="stretch", hide_index=True)
         else:
             render_empty("No source count data available.")
 
@@ -1560,7 +1560,7 @@ def render_source_overview() -> None:
             df_sentiment_display["sentiment_label"] = df_sentiment_display[
                 "sentiment_label"
             ].map(pretty_label)
-            st.dataframe(df_sentiment_display, use_container_width=True, hide_index=True)
+            st.dataframe(df_sentiment_display, width="stretch", hide_index=True)
         else:
             render_empty("No sentiment data available.")
 
@@ -1568,7 +1568,7 @@ def render_source_overview() -> None:
     if not df_top_aspects.empty:
         df_top_aspects = df_top_aspects.sort_values("count", ascending=False).head(25)
         st.bar_chart(df_top_aspects.set_index("aspect")[["count"]])
-        st.dataframe(df_top_aspects, use_container_width=True, hide_index=True)
+        st.dataframe(df_top_aspects, width="stretch", hide_index=True)
     else:
         render_empty("No aspect data available.")
 
@@ -1576,7 +1576,7 @@ def render_source_overview() -> None:
 def render_data_insights() -> None:
     action_left, action_right = st.columns([1, 3])
     with action_left:
-        load_clicked = st.button("Load data profile", type="primary", use_container_width=True)
+        load_clicked = st.button("Load data profile", type="primary", width="stretch")
     with action_right:
         st.caption("This reads the normalized parquet dataset and can take a while on the first run.")
 
@@ -1651,14 +1651,14 @@ def render_data_insights() -> None:
         if not null_counts.empty:
             null_counts = null_counts.sort_values("null_count", ascending=False)
             st.bar_chart(null_counts.set_index("field")[["null_count"]])
-            st.dataframe(null_counts, use_container_width=True, hide_index=True)
+            st.dataframe(null_counts, width="stretch", hide_index=True)
         else:
             render_empty("No null count data available.")
 
     st.markdown('<div class="rp-section-title">Source Comparison</div>', unsafe_allow_html=True)
     df_compare = pd.DataFrame(comparison.get("sources") or [])
     if not df_compare.empty:
-        st.dataframe(df_compare, use_container_width=True, hide_index=True)
+        st.dataframe(df_compare, width="stretch", hide_index=True)
         comparison_left, comparison_middle, comparison_right = st.columns(3)
         with comparison_left:
             st.caption("Average review length")
@@ -1692,7 +1692,7 @@ def render_data_insights() -> None:
             ["source", "duplicate_ratio", "empty_text_ratio", "missing_rating_ratio"]
         ]
         st.bar_chart(quality_chart.set_index("source"))
-        st.dataframe(df_quality, use_container_width=True, hide_index=True)
+        st.dataframe(df_quality, width="stretch", hide_index=True)
     else:
         render_empty("No per-source quality summary available.")
 
@@ -1704,7 +1704,7 @@ def render_data_insights() -> None:
             ["all", "amazon", "yelp", "ebay", "ifixit", "youtube"],
             key="normalization_source",
         )
-        normalize_clicked = st.button("Load normalization", use_container_width=True)
+        normalize_clicked = st.button("Load normalization", width="stretch")
     with norm_right:
         if normalize_clicked:
             selected_source = None if normalization_source == "all" else normalization_source
@@ -1774,7 +1774,7 @@ def render_hitl_view() -> None:
     with control_left:
         status_filter = st.selectbox("Status", ["pending", "all"])
     with control_right:
-        refresh_clicked = st.button("Refresh queue", type="primary", use_container_width=True)
+        refresh_clicked = st.button("Refresh queue", type="primary", width="stretch")
 
     if refresh_clicked or "hitl_rows" not in st.session_state:
         with st.spinner("Loading review queue..."):
@@ -1808,7 +1808,7 @@ def render_hitl_view() -> None:
     queue_df = pd.DataFrame(rows)
     if "flags" in queue_df.columns:
         queue_df["flags"] = queue_df["flags"].apply(lambda values: ", ".join(values or []))
-    st.dataframe(queue_df, use_container_width=True, hide_index=True)
+    st.dataframe(queue_df, width="stretch", hide_index=True)
 
     st.markdown('<div class="rp-section-title">Queued Requests</div>', unsafe_allow_html=True)
     for index, row in enumerate(rows[:25], start=1):
@@ -1844,7 +1844,7 @@ def render_hitl_view() -> None:
 
 
 def render_pipeline_ops_view() -> None:
-    if st.button("Refresh pipeline status", type="primary", use_container_width=True):
+    if st.button("Refresh pipeline status", type="primary", width="stretch"):
         load_pipeline_status.clear()
         with st.spinner("Inspecting local pipeline artifacts..."):
             try:
@@ -1879,13 +1879,13 @@ def render_pipeline_ops_view() -> None:
     with left:
         st.markdown('<div class="rp-section-title">Source Coverage</div>', unsafe_allow_html=True)
         if not sources.empty:
-            st.dataframe(sources, use_container_width=True, hide_index=True)
+            st.dataframe(sources, width="stretch", hide_index=True)
         else:
             render_empty("No source coverage rows found.")
     with right:
         st.markdown('<div class="rp-section-title">Artifacts</div>', unsafe_allow_html=True)
         if not artifacts.empty:
-            st.dataframe(artifacts, use_container_width=True, hide_index=True)
+            st.dataframe(artifacts, width="stretch", hide_index=True)
         else:
             render_empty("No artifacts found.")
 
@@ -1893,12 +1893,12 @@ def render_pipeline_ops_view() -> None:
     dag_col, log_col = st.columns(2)
     with dag_col:
         if not dags.empty:
-            st.dataframe(dags, use_container_width=True, hide_index=True)
+            st.dataframe(dags, width="stretch", hide_index=True)
         else:
             render_empty("No DAG files found in the repository.")
     with log_col:
         if not logs.empty:
-            st.dataframe(logs, use_container_width=True, hide_index=True)
+            st.dataframe(logs, width="stretch", hide_index=True)
         else:
             render_empty("No log files found yet.")
 
@@ -1944,7 +1944,7 @@ def render_settings_about_view() -> None:
         {"feature": "Pipeline Ops", "backend": "/pipeline/status", "status": "local artifact status"},
         {"feature": "Token/Cost Tracking", "backend": "not present", "status": "not implemented in repo"},
     ]
-    st.dataframe(pd.DataFrame(feature_rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(feature_rows), width="stretch", hide_index=True)
 
     st.markdown('<div class="rp-section-title">Run Commands</div>', unsafe_allow_html=True)
     st.code(
