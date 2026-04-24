@@ -26,6 +26,7 @@ from src.retrieval.embedding_backend import (
     load_embedding_backend,
     write_embedding_backend_metadata,
 )
+from src.retrieval.sqlite_vector_store import SQLiteReviewVectorStore, sqlite_store_exists
 
 
 class FakeEmbeddingDataFrame:
@@ -183,3 +184,63 @@ def test_load_embedding_backend_uses_hashing_metadata(tmp_path: Path):
     assert loaded.backend_name == "hashing"
     assert loaded.model_name == fallback_backend.model_name
     assert len(encode_texts(loaded, ["query text"])[0]) == getattr(loaded.model, "dimensions")
+
+
+def test_sqlite_vector_store_searches_with_hashing_embeddings(tmp_path: Path):
+    store_path = tmp_path / "chromadb_reviews"
+    backend = EmbeddingBackend(
+        model=HashingEmbeddingModel(32),
+        backend_name="hashing",
+        model_name="hashing-32",
+    )
+    payloads = [
+        (
+            "r1",
+            "The battery lasts all day and the screen is bright.",
+            {
+                "source": "amazon",
+                "product_name": "Phone",
+                "product_category": "Electronics",
+                "display_name": "Phone Review",
+                "display_category": "Electronics",
+                "entity_type": "product_review",
+                "aspect_labels": "battery",
+                "aspect_count": 1,
+                "sentiment_label": "positive",
+                "sentiment_score": 0.8,
+                "source_url": "https://example.com/r1",
+            },
+        ),
+        (
+            "r2",
+            "The pizza crust was crisp and the sauce tasted fresh.",
+            {
+                "source": "yelp",
+                "product_name": "Restaurant",
+                "product_category": "Food",
+                "display_name": "Restaurant Review",
+                "display_category": "Food",
+                "entity_type": "business_review",
+                "aspect_labels": "food",
+                "aspect_count": 1,
+                "sentiment_label": "positive",
+                "sentiment_score": 0.7,
+                "source_url": "https://example.com/r2",
+            },
+        ),
+    ]
+    embeddings = encode_texts(backend, [payload[1] for payload in payloads])
+
+    store = SQLiteReviewVectorStore(store_path)
+    try:
+        store.initialize()
+        assert store.upsert(payloads, embeddings) == 2
+        assert sqlite_store_exists(store_path)
+
+        results = store.search(query="battery screen", embedding_backend=backend, n_results=1)
+
+        assert results[0]["source"] == "amazon"
+        assert results[0]["display_name"] == "Phone Review"
+        assert results[0]["aspect_count"] == 1
+    finally:
+        store.close()

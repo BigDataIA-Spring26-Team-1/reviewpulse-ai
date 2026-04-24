@@ -15,8 +15,10 @@ from src.common.settings import Settings
  
 try:
     import boto3
+    from boto3.s3.transfer import TransferConfig
 except ImportError:
     boto3 = None
+    TransferConfig = None
  
  
 def sanitize_storage_component(value: str) -> str:
@@ -124,11 +126,30 @@ class S3StorageManager:
     def copy_object(self, source_uri: str, destination_uri: str) -> str:
         source_bucket, source_key = parse_s3_uri(source_uri)
         destination_bucket, destination_key = parse_s3_uri(destination_uri)
-        self.client.copy_object(
-            Bucket=destination_bucket,
-            Key=destination_key,
-            CopySource={"Bucket": source_bucket, "Key": source_key},
-        )
+        managed_copy = getattr(self.client, "copy", None)
+        if callable(managed_copy):
+            config = (
+                TransferConfig(
+                    multipart_threshold=64 * 1024 * 1024,
+                    multipart_chunksize=64 * 1024 * 1024,
+                )
+                if TransferConfig is not None
+                else None
+            )
+            kwargs: dict[str, Any] = {
+                "CopySource": {"Bucket": source_bucket, "Key": source_key},
+                "Bucket": destination_bucket,
+                "Key": destination_key,
+            }
+            if config is not None:
+                kwargs["Config"] = config
+            managed_copy(**kwargs)
+        else:
+            self.client.copy_object(
+                Bucket=destination_bucket,
+                Key=destination_key,
+                CopySource={"Bucket": source_bucket, "Key": source_key},
+            )
         return destination_uri
 
     def download_file(self, source_uri: str, local_path: Path) -> Path:
@@ -312,11 +333,7 @@ class S3StorageManager:
             destination_key = "/".join(
                 part for part in [current_prefix.rstrip("/"), relative_key] if part
             )
-            self.client.copy_object(
-                Bucket=current_bucket,
-                Key=destination_key,
-                CopySource={"Bucket": source_bucket, "Key": source_key},
-            )
+            self.copy_object(source_uri, join_s3_uri(current_bucket, destination_key))
             copied_count += 1
             if progress_callback and (
                 copied_count == total_objects
