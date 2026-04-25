@@ -22,7 +22,7 @@ The project is data-first. Ingestion, storage, Spark normalization, data quality
 | GitHub Repository | This repository |
 | Backend | https://reviewpulse-api-3ogueqhipq-uc.a.run.app/docs |
 | Frontend | https://reviewpulse-ai.streamlit.app |
-| Codelabs | |
+| Codelabs | https://codelabs-preview.appspot.com/?file_id=1zNPj9MjjPfomXv5khlc4jJF5ebEIorrTaD4-n34Tjpg#0 |
 | Video Demo on YouTube | [![ReviewPulse AI Demo](https://i.ytimg.com/vi/_BFsHwxeCTs/hqdefault.jpg)](https://youtu.be/_BFsHwxeCTs)<br>https://youtu.be/_BFsHwxeCTs |
  
 ## Final Project Checklist
