@@ -32,6 +32,7 @@ API_BASE_CANDIDATES = (
     "http://127.0.0.1:8000",
     "http://127.0.0.1:8001",
 )
+API_PROBE_TIMEOUT_SECONDS = 3
 STATS_TIMEOUT_SECONDS = 180
 DATA_TIMEOUT_SECONDS = 180
 RAG_TIMEOUT_SECONDS = 120
@@ -520,13 +521,30 @@ def api_error(payload: Any) -> str | None:
 @st.cache_data(ttl=15, show_spinner=False)
 def resolve_api_base() -> str:
     candidates = list(dict.fromkeys(base for base in API_BASE_CANDIDATES if base))
-    for base_url in candidates:
+    healthy_candidates: list[tuple[int, str]] = []
+    for index, base_url in enumerate(candidates):
         try:
-            response = requests.get(f"{base_url}/health", timeout=3)
+            response = requests.get(f"{base_url}/health", timeout=API_PROBE_TIMEOUT_SECONDS)
             if 200 <= response.status_code < 300:
-                return base_url
+                healthy_candidates.append((index, base_url))
         except requests.exceptions.RequestException:
             continue
+
+    for index, base_url in healthy_candidates:
+        try:
+            response = requests.get(f"{base_url}/dashboard/summary", timeout=API_PROBE_TIMEOUT_SECONDS)
+            if not 200 <= response.status_code < 300:
+                continue
+            payload = response.json()
+            total_reviews = safe_int(payload.get("total_reviews")) if isinstance(payload, dict) else 0
+            indexed_documents = safe_int(payload.get("indexed_documents")) if isinstance(payload, dict) else 0
+            if total_reviews > 0 or indexed_documents > 0:
+                return base_url
+        except (ValueError, requests.exceptions.RequestException):
+            continue
+
+    if healthy_candidates:
+        return min(healthy_candidates)[1]
     return CONFIGURED_API_BASE
 
 
@@ -893,6 +911,12 @@ def render_sidebar() -> str:
         resolve_api_base.clear()
         load_health.clear()
         load_detailed_health.clear()
+        load_dashboard_summary.clear()
+        load_review_options.clear()
+        load_sentiment_analytics.clear()
+        load_product_compare.clear()
+        load_aspect_summary.clear()
+        load_pipeline_status.clear()
         st.rerun()
 
     st.sidebar.link_button("Swagger docs", f"{api_base}/docs", width="stretch")
@@ -1073,7 +1097,21 @@ def render_review_explorer() -> None:
         "helpful_votes",
         "source_url",
     ]
-    st.dataframe(pd.DataFrame(rows)[table_cols], width="stretch", hide_index=True)
+    table_df = pd.DataFrame(rows)
+    if "product_label" not in table_df.columns:
+        table_df["product_label"] = ""
+    for fallback_column in ("product_title", "product_name", "display_name"):
+        if fallback_column in table_df.columns:
+            fallback_values = table_df[fallback_column].fillna("").astype(str)
+            table_df["product_label"] = table_df["product_label"].fillna("").astype(str)
+            table_df["product_label"] = table_df["product_label"].where(
+                table_df["product_label"].str.strip().ne(""),
+                fallback_values,
+            )
+    for table_column in table_cols:
+        if table_column not in table_df.columns:
+            table_df[table_column] = ""
+    st.dataframe(table_df[table_cols], width="stretch", hide_index=True)
     for index, row in enumerate(rows[:10], start=1):
         render_review_card(row, index=index, label="Review", include_distance=False)
 

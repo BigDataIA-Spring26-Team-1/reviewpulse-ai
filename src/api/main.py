@@ -54,6 +54,7 @@ from src.app_logic import (
 from src.insights.arrow_metrics import build_arrow_data_insights
 from src.insights.app_analytics import (
     ReviewFilter,
+    RATING_BINS,
     build_aspect_intelligence,
     build_dashboard_summary,
     build_pipeline_status,
@@ -61,6 +62,7 @@ from src.insights.app_analytics import (
     compare_products,
     explore_reviews,
     list_filter_options,
+    sqlite_vector_count,
 )
 from src.insights import (
     build_normalization_explanations,
@@ -134,6 +136,48 @@ REDIS_VECTOR_CACHE_TTL_SECONDS = _int_env("REDIS_VECTOR_CACHE_TTL_SECONDS", 3600
 RUNTIME_DIR = PROJECT_ROOT / ".runtime"
 LOGS_DIR = PROJECT_ROOT / "logs"
 DAGS_DIR = PROJECT_ROOT / "dags"
+
+
+def _quote_snowflake_identifier(value: str) -> str:
+    cleaned = str(value or "").strip()
+    if not cleaned:
+        raise ValueError("Snowflake identifier cannot be empty.")
+    return '"' + cleaned.replace('"', '""') + '"'
+
+
+def _snowflake_table_name(table_name: str) -> str:
+    return ".".join(
+        _quote_snowflake_identifier(part)
+        for part in (
+            settings.snowflake_database,
+            settings.snowflake_schema,
+            table_name,
+        )
+    )
+
+
+def _snowflake_uri(table_name: str) -> str:
+    return (
+        "snowflake://"
+        f"{settings.snowflake_database}/{settings.snowflake_schema}/{table_name}"
+    )
+
+
+def _connect_snowflake() -> Any:
+    connector = importlib.import_module("snowflake.connector")
+    connect_kwargs: dict[str, Any] = {
+        "account": settings.snowflake_account,
+        "user": settings.snowflake_user,
+        "password": settings.snowflake_password,
+        "warehouse": settings.snowflake_warehouse,
+        "database": settings.snowflake_database,
+        "schema": settings.snowflake_schema,
+        "login_timeout": int(max(1, HEALTHCHECK_TIMEOUT_SECONDS)),
+        "network_timeout": int(max(1, HEALTHCHECK_TIMEOUT_SECONDS)),
+    }
+    if settings.snowflake_role:
+        connect_kwargs["role"] = settings.snowflake_role
+    return connector.connect(**connect_kwargs)
 
 
 class SearchResponse(BaseModel):
@@ -265,12 +309,650 @@ def get_collection():
     return client.get_collection(name=CHROMA_COLLECTION_NAME)
 
 
+def _has_parquet_files(dataset_path: Path) -> bool:
+    if dataset_path.is_file():
+        return dataset_path.suffix.lower() == ".parquet"
+    if not dataset_path.is_dir():
+        return False
+    return any(path.is_file() for path in dataset_path.rglob("*.parquet"))
+
+
 def get_insights_dataset_path() -> Path | None:
-    if settings.normalized_parquet_path.exists():
-        return settings.normalized_parquet_path
-    if settings.sentiment_parquet_path.exists():
+    if _has_parquet_files(settings.sentiment_parquet_path):
         return settings.sentiment_parquet_path
+    if _has_parquet_files(settings.normalized_parquet_path):
+        return settings.normalized_parquet_path
     return None
+
+
+@lru_cache(maxsize=8)
+def _snowflake_table_exists(table_name: str) -> bool:
+    if not settings.snowflake_enabled:
+        return False
+    connection = None
+    cursor = None
+    try:
+        connection = _connect_snowflake()
+        cursor = connection.cursor()
+        cursor.execute(f"SELECT 1 FROM {_snowflake_table_name(table_name)} LIMIT 1")
+        return True
+    except Exception:
+        return False
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if connection is not None:
+            connection.close()
+
+
+def _snowflake_insights_table() -> str | None:
+    if _snowflake_table_exists(settings.snowflake_sentiment_table):
+        return settings.snowflake_sentiment_table
+    if _snowflake_table_exists(settings.snowflake_normalized_table):
+        return settings.snowflake_normalized_table
+    return None
+
+
+def _snowflake_rows_to_dicts(cursor: Any, rows: list[Any]) -> list[dict[str, Any]]:
+    columns = [str(description[0]).lower() for description in cursor.description]
+    output: list[dict[str, Any]] = []
+    for row in rows:
+        payload: dict[str, Any] = {}
+        for column, value in zip(columns, row):
+            if isinstance(value, datetime):
+                payload[column] = value.isoformat()
+            else:
+                payload[column] = value
+        output.append(payload)
+    return output
+
+
+@lru_cache(maxsize=8)
+def build_snowflake_dashboard_summary(table_name: str) -> dict[str, Any]:
+    connection = _connect_snowflake()
+    cursor = connection.cursor()
+    try:
+        cursor.execute(
+            f"""
+            SELECT
+                COUNT(*),
+                COUNT(DISTINCT "source"),
+                COUNT(DISTINCT "product_name"),
+                MAX("review_date")
+            FROM {_snowflake_table_name(table_name)}
+            """
+        )
+        row = cursor.fetchone() or (0, 0, 0, None)
+    finally:
+        cursor.close()
+        connection.close()
+
+    latest_review_date = row[3].isoformat() if isinstance(row[3], datetime) else row[3]
+    vector_count = sqlite_vector_count(settings.chroma_path)
+    hitl_count = 0
+    hitl_queue_path = RUNTIME_DIR / "hitl_queue.jsonl"
+    if hitl_queue_path.exists():
+        hitl_count = sum(1 for line in hitl_queue_path.read_text(encoding="utf-8").splitlines() if line.strip())
+
+    return {
+        "dataset_path": _snowflake_uri(table_name),
+        "total_reviews": int(row[0] or 0),
+        "sources_integrated": int(row[1] or 0),
+        "products_tracked": int(row[2] or 0),
+        "positive_sentiment_ratio": None,
+        "indexed_documents": vector_count,
+        "hitl_queue_items": hitl_count,
+        "latest_review_date": latest_review_date,
+        "latest_dataset_update": latest_review_date,
+        "artifact_dirs": [
+            {
+                "name": table_name,
+                "path": _snowflake_uri(table_name),
+                "exists": True,
+                "updated_at": latest_review_date,
+            },
+            {
+                "name": "chromadb_reviews",
+                "path": str(settings.chroma_path),
+                "exists": settings.chroma_path.exists(),
+                "updated_at": datetime.fromtimestamp(settings.chroma_path.stat().st_mtime, UTC).isoformat()
+                if settings.chroma_path.exists()
+                else None,
+            },
+        ],
+    }
+
+
+def build_snowflake_review_options(table_name: str, *, limit: int = 200) -> dict[str, Any]:
+    connection = _connect_snowflake()
+    cursor = connection.cursor()
+    try:
+        table = _snowflake_table_name(table_name)
+        cursor.execute(
+            f"""
+            SELECT "product_name", ANY_VALUE("source"), ANY_VALUE("display_name"),
+                   ANY_VALUE("source_url"), COUNT(*) AS review_count
+            FROM {table}
+            WHERE "product_name" IS NOT NULL AND "product_name" != ''
+            GROUP BY "product_name"
+            ORDER BY review_count DESC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        product_rows = _snowflake_rows_to_dicts(cursor, cursor.fetchall())
+
+        cursor.execute(
+            f"""
+            SELECT "product_category", COUNT(*) AS review_count
+            FROM {table}
+            WHERE "product_category" IS NOT NULL AND "product_category" != ''
+            GROUP BY "product_category"
+            ORDER BY review_count DESC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        categories = _snowflake_rows_to_dicts(cursor, cursor.fetchall())
+
+        cursor.execute(
+            f"""
+            SELECT LOWER("source") AS source, COUNT(*) AS review_count
+            FROM {table}
+            WHERE "source" IS NOT NULL AND "source" != ''
+            GROUP BY LOWER("source")
+            ORDER BY source
+            """
+        )
+        sources = _snowflake_rows_to_dicts(cursor, cursor.fetchall())
+
+        sentiments: list[dict[str, Any]] = []
+        if table_name == settings.snowflake_sentiment_table:
+            cursor.execute(
+                f"""
+                SELECT LOWER("sentiment_label") AS sentiment_label, COUNT(*) AS review_count
+                FROM {table}
+                WHERE "sentiment_label" IS NOT NULL AND "sentiment_label" != ''
+                GROUP BY LOWER("sentiment_label")
+                ORDER BY sentiment_label
+                """
+            )
+            sentiments = _snowflake_rows_to_dicts(cursor, cursor.fetchall())
+
+        cursor.execute(f'SELECT MIN("review_date"), MAX("review_date"), COUNT(*) FROM {table}')
+        range_row = cursor.fetchone() or (None, None, 0)
+    finally:
+        cursor.close()
+        connection.close()
+
+    enriched_products = attach_product_labels(
+        [
+            {
+                "product_name": row.get("product_name"),
+                "source": row.get("any_value(\"source\")") or row.get("source"),
+                "display_name": row.get("any_value(\"display_name\")") or row.get("display_name"),
+                "source_url": row.get("any_value(\"source_url\")") or row.get("source_url"),
+                "review_count": row.get("review_count"),
+            }
+            for row in product_rows
+        ]
+    )
+
+    def _date_value(value: Any) -> str | None:
+        return value.isoformat() if isinstance(value, datetime) else value
+
+    return {
+        "products": enriched_products,
+        "categories": categories,
+        "sources": sources,
+        "sentiments": sentiments,
+        "date_range": {
+            "min": _date_value(range_row[0]),
+            "max": _date_value(range_row[1]),
+        },
+        "rows_scanned": int(range_row[2] or 0),
+        "scan_limited": False,
+        "max_rows": None,
+        "dataset_path": _snowflake_uri(table_name),
+    }
+
+
+def explore_snowflake_reviews(
+    table_name: str,
+    filters: ReviewFilter,
+    *,
+    limit: int,
+    offset: int,
+) -> dict[str, Any]:
+    where_parts: list[str] = []
+    params: list[Any] = []
+    has_sentiment_columns = table_name == settings.snowflake_sentiment_table
+
+    if filters.query:
+        like_value = f"%{filters.query}%"
+        query_columns = ['"review_text"', '"product_name"', '"product_category"', '"display_name"']
+        if has_sentiment_columns:
+            query_columns.append('"aspect_labels"')
+        where_parts.append("(" + " OR ".join(f"{column} ILIKE %s" for column in query_columns) + ")")
+        params.extend([like_value] * len(query_columns))
+    if filters.source:
+        where_parts.append('"source" ILIKE %s')
+        params.append(filters.source)
+    if filters.product:
+        where_parts.append('"product_name" = %s')
+        params.append(filters.product)
+    if filters.category:
+        where_parts.append('"product_category" ILIKE %s')
+        params.append(f"%{filters.category}%")
+    if filters.date_start:
+        where_parts.append('"review_date" >= %s')
+        params.append(filters.date_start.replace(tzinfo=None))
+    if filters.date_end:
+        where_parts.append('"review_date" <= %s')
+        params.append(filters.date_end.replace(tzinfo=None))
+    if filters.min_rating is not None:
+        where_parts.append('"rating_normalized" >= %s')
+        params.append(filters.min_rating)
+    if filters.max_rating is not None:
+        where_parts.append('"rating_normalized" <= %s')
+        params.append(filters.max_rating)
+    if filters.sentiment and not has_sentiment_columns:
+        where_parts.append("1 = 0")
+    elif filters.sentiment:
+        where_parts.append('"sentiment_label" ILIKE %s')
+        params.append(filters.sentiment)
+
+    where_clause = " WHERE " + " AND ".join(where_parts) if where_parts else ""
+    table = _snowflake_table_name(table_name)
+    sentiment_select = (
+        '"sentiment_label", "sentiment_score", "aspect_labels", "aspect_count",'
+        if has_sentiment_columns
+        else "'' AS sentiment_label, 0.0 AS sentiment_score, '' AS aspect_labels, 0 AS aspect_count,"
+    )
+
+    connection = _connect_snowflake()
+    cursor = connection.cursor()
+    try:
+        cursor.execute(f"SELECT COUNT(*) FROM {table}{where_clause}", tuple(params))
+        matched_count = int((cursor.fetchone() or [0])[0] or 0)
+        cursor.execute(
+            f"""
+            SELECT "review_id", "source", "product_name", "product_category",
+                   "display_name", "display_category", "entity_type",
+                   "rating_normalized", {sentiment_select}
+                   "review_date", "helpful_votes", "source_url", "review_text"
+            FROM {table}
+            {where_clause}
+            ORDER BY "review_date" DESC NULLS LAST, "review_id"
+            LIMIT %s OFFSET %s
+            """,
+            tuple([*params, limit, offset]),
+        )
+        rows = _snowflake_rows_to_dicts(cursor, cursor.fetchall())
+    finally:
+        cursor.close()
+        connection.close()
+
+    return {
+        "rows": attach_product_labels(rows),
+        "matched_count": matched_count,
+        "limit": limit,
+        "offset": offset,
+        "has_more": matched_count > offset + len(rows),
+        "dataset_path": _snowflake_uri(table_name),
+    }
+
+
+def _snowflake_filter_sql(
+    filters: ReviewFilter,
+    *,
+    has_sentiment_columns: bool,
+    include_query_aspects: bool = False,
+) -> tuple[str, tuple[Any, ...]]:
+    where_parts: list[str] = []
+    params: list[Any] = []
+
+    if filters.query:
+        like_value = f"%{filters.query}%"
+        query_columns = ['"review_text"', '"product_name"', '"product_category"', '"display_name"']
+        if include_query_aspects and has_sentiment_columns:
+            query_columns.append('"aspect_labels"')
+        where_parts.append("(" + " OR ".join(f"{column} ILIKE %s" for column in query_columns) + ")")
+        params.extend([like_value] * len(query_columns))
+    if filters.source:
+        where_parts.append('"source" ILIKE %s')
+        params.append(filters.source)
+    if filters.product:
+        where_parts.append('"product_name" = %s')
+        params.append(filters.product)
+    if filters.category:
+        where_parts.append('"product_category" ILIKE %s')
+        params.append(f"%{filters.category}%")
+    if filters.date_start:
+        where_parts.append('"review_date" >= %s')
+        params.append(filters.date_start.replace(tzinfo=None))
+    if filters.date_end:
+        where_parts.append('"review_date" <= %s')
+        params.append(filters.date_end.replace(tzinfo=None))
+    if filters.min_rating is not None:
+        where_parts.append('"rating_normalized" >= %s')
+        params.append(filters.min_rating)
+    if filters.max_rating is not None:
+        where_parts.append('"rating_normalized" <= %s')
+        params.append(filters.max_rating)
+    if filters.sentiment and not has_sentiment_columns:
+        where_parts.append("1 = 0")
+    elif filters.sentiment:
+        where_parts.append('"sentiment_label" ILIKE %s')
+        params.append(filters.sentiment)
+
+    return (" WHERE " + " AND ".join(where_parts) if where_parts else ""), tuple(params)
+
+
+def _rating_bucket_case() -> str:
+    return (
+        "CASE "
+        "WHEN \"rating_normalized\" >= 0 AND \"rating_normalized\" < 0.2 THEN '0.0-0.2' "
+        "WHEN \"rating_normalized\" >= 0.2 AND \"rating_normalized\" < 0.4 THEN '0.2-0.4' "
+        "WHEN \"rating_normalized\" >= 0.4 AND \"rating_normalized\" < 0.6 THEN '0.4-0.6' "
+        "WHEN \"rating_normalized\" >= 0.6 AND \"rating_normalized\" < 0.8 THEN '0.6-0.8' "
+        "WHEN \"rating_normalized\" >= 0.8 AND \"rating_normalized\" <= 1.0 THEN '0.8-1.0' "
+        "ELSE NULL END"
+    )
+
+
+def build_snowflake_source_stats(table_name: str) -> dict[str, list[dict[str, Any]]]:
+    table = _snowflake_table_name(table_name)
+    has_sentiment_columns = table_name == settings.snowflake_sentiment_table
+    connection = _connect_snowflake()
+    cursor = connection.cursor()
+    try:
+        cursor.execute(
+            f"""
+            SELECT LOWER("source") AS source, COUNT(*) AS count
+            FROM {table}
+            GROUP BY LOWER("source")
+            ORDER BY count DESC
+            """
+        )
+        source_counts = _snowflake_rows_to_dicts(cursor, cursor.fetchall())
+
+        if has_sentiment_columns:
+            cursor.execute(
+                f"""
+                SELECT LOWER("source") AS source, LOWER("sentiment_label") AS sentiment_label, COUNT(*) AS count
+                FROM {table}
+                GROUP BY LOWER("source"), LOWER("sentiment_label")
+                ORDER BY source, sentiment_label
+                """
+            )
+            sentiment_breakdown = _snowflake_rows_to_dicts(cursor, cursor.fetchall())
+        else:
+            sentiment_breakdown = [
+                {"source": row["source"], "sentiment_label": "unscored", "count": row["count"]}
+                for row in source_counts
+            ]
+    finally:
+        cursor.close()
+        connection.close()
+
+    return {
+        "source_counts": source_counts,
+        "sentiment_breakdown": sentiment_breakdown,
+        "top_aspects": [],
+    }
+
+
+def build_snowflake_sentiment_analytics(
+    table_name: str,
+    filters: ReviewFilter,
+    *,
+    max_rows: int | None = None,
+) -> dict[str, Any]:
+    table = _snowflake_table_name(table_name)
+    has_sentiment_columns = table_name == settings.snowflake_sentiment_table
+    where_clause, params = _snowflake_filter_sql(
+        filters,
+        has_sentiment_columns=has_sentiment_columns,
+        include_query_aspects=True,
+    )
+    bucket_case = _rating_bucket_case()
+    connection = _connect_snowflake()
+    cursor = connection.cursor()
+    try:
+        cursor.execute(f"SELECT COUNT(*) FROM {table}{where_clause}", params)
+        record_count = int((cursor.fetchone() or [0])[0] or 0)
+
+        if has_sentiment_columns:
+            cursor.execute(
+                f"""
+                SELECT LOWER("sentiment_label") AS sentiment_label, COUNT(*) AS count
+                FROM {table}
+                {where_clause}
+                GROUP BY LOWER("sentiment_label")
+                ORDER BY sentiment_label
+                """,
+                params,
+            )
+            sentiment_distribution = _snowflake_rows_to_dicts(cursor, cursor.fetchall())
+        else:
+            sentiment_distribution = [{"sentiment_label": "unscored", "count": record_count}] if record_count else []
+
+        cursor.execute(
+            f"""
+            SELECT {bucket_case} AS rating_bucket, COUNT(*) AS count
+            FROM {table}
+            {where_clause}
+            GROUP BY {bucket_case}
+            """,
+            params,
+        )
+        rating_counts = {
+            row["rating_bucket"]: int(row["count"] or 0)
+            for row in _snowflake_rows_to_dicts(cursor, cursor.fetchall())
+            if row.get("rating_bucket")
+        }
+
+        if has_sentiment_columns:
+            cursor.execute(
+                f"""
+                SELECT LOWER("source") AS source, LOWER("sentiment_label") AS sentiment_label, COUNT(*) AS count
+                FROM {table}
+                {where_clause}
+                GROUP BY LOWER("source"), LOWER("sentiment_label")
+                ORDER BY source, sentiment_label
+                """,
+                params,
+            )
+            source_sentiment = _snowflake_rows_to_dicts(cursor, cursor.fetchall())
+            cursor.execute(
+                f"""
+                SELECT TO_CHAR(DATE_TRUNC('month', "review_date"), 'YYYY-MM') AS month,
+                       LOWER("sentiment_label") AS sentiment_label,
+                       COUNT(*) AS count
+                FROM {table}
+                {where_clause}
+                GROUP BY DATE_TRUNC('month', "review_date"), LOWER("sentiment_label")
+                ORDER BY month, sentiment_label
+                """,
+                params,
+            )
+            monthly_trend = _snowflake_rows_to_dicts(cursor, cursor.fetchall())
+        else:
+            cursor.execute(
+                f"""
+                SELECT LOWER("source") AS source, COUNT(*) AS count
+                FROM {table}
+                {where_clause}
+                GROUP BY LOWER("source")
+                ORDER BY source
+                """,
+                params,
+            )
+            source_sentiment = [
+                {"source": row["source"], "sentiment_label": "unscored", "count": row["count"]}
+                for row in _snowflake_rows_to_dicts(cursor, cursor.fetchall())
+            ]
+            cursor.execute(
+                f"""
+                SELECT TO_CHAR(DATE_TRUNC('month', "review_date"), 'YYYY-MM') AS month,
+                       COUNT(*) AS count
+                FROM {table}
+                {where_clause}
+                GROUP BY DATE_TRUNC('month', "review_date")
+                ORDER BY month
+                """,
+                params,
+            )
+            monthly_trend = [
+                {"month": row["month"], "sentiment_label": "unscored", "count": row["count"]}
+                for row in _snowflake_rows_to_dicts(cursor, cursor.fetchall())
+            ]
+    finally:
+        cursor.close()
+        connection.close()
+
+    return {
+        "record_count": record_count,
+        "sentiment_distribution": sentiment_distribution,
+        "rating_distribution": [
+            {"rating_bucket": label, "count": rating_counts.get(label, 0)}
+            for _lower, _upper, label in RATING_BINS
+        ],
+        "source_sentiment": source_sentiment,
+        "monthly_trend": monthly_trend,
+        "top_aspects": [],
+        "dataset_path": _snowflake_uri(table_name),
+        "rows_scanned": record_count,
+        "scan_limited": False,
+        "max_rows": max_rows,
+    }
+
+
+def compare_snowflake_products(
+    table_name: str,
+    product_names: list[str],
+    filters: ReviewFilter,
+    *,
+    max_rows: int | None = None,
+) -> dict[str, Any]:
+    table = _snowflake_table_name(table_name)
+    has_sentiment_columns = table_name == settings.snowflake_sentiment_table
+    products: list[dict[str, Any]] = []
+    requested = [name.strip() for name in product_names if name and name.strip()]
+    base_where, base_params = _snowflake_filter_sql(
+        filters,
+        has_sentiment_columns=has_sentiment_columns,
+        include_query_aspects=True,
+    )
+    base_parts = [base_where.removeprefix(" WHERE ")] if base_where else []
+    connection = _connect_snowflake()
+    cursor = connection.cursor()
+    try:
+        cursor.execute(f"SELECT COUNT(*) FROM {table}{base_where}", base_params)
+        scanned_rows = int((cursor.fetchone() or [0])[0] or 0)
+        for product_name in requested:
+            where_parts = [part for part in base_parts if part]
+            where_parts.append('"product_name" = %s')
+            params = [*base_params, product_name]
+            where_clause = " WHERE " + " AND ".join(where_parts)
+            sentiment_avg = 'AVG("sentiment_score")' if has_sentiment_columns else "NULL"
+            cursor.execute(
+                f"""
+                SELECT COUNT(*) AS review_count,
+                       AVG("rating_normalized") AS average_rating_normalized,
+                       {sentiment_avg} AS average_sentiment_score,
+                       MAX("review_date") AS latest_review_date,
+                       ANY_VALUE("source") AS source,
+                       ANY_VALUE("display_name") AS display_name,
+                       ANY_VALUE("source_url") AS source_url
+                FROM {table}
+                {where_clause}
+                """,
+                tuple(params),
+            )
+            rows = _snowflake_rows_to_dicts(cursor, cursor.fetchall())
+            row = rows[0] if rows else {}
+            enriched = attach_product_labels(
+                [
+                    {
+                        "product_name": product_name,
+                        "source": row.get("source"),
+                        "display_name": row.get("display_name"),
+                        "source_url": row.get("source_url"),
+                    }
+                ]
+            )[0]
+            latest = row.get("latest_review_date")
+            products.append(
+                {
+                    "product_name": product_name,
+                    "product_title": enriched.get("product_title"),
+                    "product_label": enriched.get("product_label"),
+                    "review_count": int(row.get("review_count") or 0),
+                    "average_rating_normalized": round(float(row["average_rating_normalized"]), 4)
+                    if row.get("average_rating_normalized") is not None
+                    else None,
+                    "average_sentiment_score": round(float(row["average_sentiment_score"]), 4)
+                    if row.get("average_sentiment_score") is not None
+                    else None,
+                    "sentiment_distribution": [],
+                    "source_distribution": [],
+                    "top_positive_aspects": [],
+                    "top_negative_aspects": [],
+                    "latest_review_date": latest,
+                }
+            )
+    finally:
+        cursor.close()
+        connection.close()
+
+    return {
+        "products": products,
+        "dataset_path": _snowflake_uri(table_name),
+        "rows_scanned": scanned_rows,
+        "scan_limited": False,
+        "max_rows": max_rows,
+    }
+
+
+def build_snowflake_aspect_intelligence(
+    table_name: str,
+    filters: ReviewFilter,
+    *,
+    max_rows: int | None = None,
+) -> dict[str, Any]:
+    if table_name != settings.snowflake_sentiment_table:
+        where_clause, params = _snowflake_filter_sql(filters, has_sentiment_columns=False)
+        connection = _connect_snowflake()
+        cursor = connection.cursor()
+        try:
+            cursor.execute(f"SELECT COUNT(*) FROM {_snowflake_table_name(table_name)}{where_clause}", params)
+            rows_scanned = int((cursor.fetchone() or [0])[0] or 0)
+        finally:
+            cursor.close()
+            connection.close()
+        return {
+            "rows_with_aspects": 0,
+            "aspects": [],
+            "top_positive_aspects": [],
+            "top_negative_aspects": [],
+            "dataset_path": _snowflake_uri(table_name),
+            "rows_scanned": rows_scanned,
+            "scan_limited": False,
+            "max_rows": max_rows,
+        }
+
+    return {
+        "rows_with_aspects": 0,
+        "aspects": [],
+        "top_positive_aspects": [],
+        "top_negative_aspects": [],
+        "dataset_path": _snowflake_uri(table_name),
+        "rows_scanned": 0,
+        "scan_limited": False,
+        "max_rows": max_rows,
+    }
 
 
 def load_insights_rows() -> tuple[list[dict[str, Any]] | None, Path | None]:
@@ -425,9 +1107,9 @@ def looks_like_machine_id(value: str) -> bool:
 
 
 def clean_display_name(meta: dict) -> str:
-    source = str(meta.get("source", "")).strip()
-    display_name = str(meta.get("display_name", "")).strip()
-    product_name = str(meta.get("product_name", "")).strip()
+    source = str(meta.get("source") or "").strip()
+    display_name = str(meta.get("display_name") or "").strip()
+    product_name = str(meta.get("product_name") or "").strip()
 
     if source == "amazon":
         if display_name and not looks_like_machine_id(display_name.replace("Amazon Electronics Item ", "")):
@@ -459,9 +1141,9 @@ def clean_display_name(meta: dict) -> str:
 
 
 def clean_display_category(meta: dict) -> str:
-    source = str(meta.get("source", "")).strip()
-    display_category = str(meta.get("display_category", "")).strip()
-    product_category = str(meta.get("product_category", "")).strip()
+    source = str(meta.get("source") or "").strip()
+    display_category = str(meta.get("display_category") or "").strip()
+    product_category = str(meta.get("product_category") or "").strip()
 
     if source == "amazon":
         return display_category or "Electronics Product"
@@ -479,7 +1161,7 @@ def clean_display_category(meta: dict) -> str:
 
 
 def clean_entity_type(meta: dict) -> str:
-    entity_type = str(meta.get("entity_type", "")).strip()
+    entity_type = str(meta.get("entity_type") or "").strip()
     if entity_type:
         return entity_type
 
@@ -495,9 +1177,9 @@ def clean_entity_type(meta: dict) -> str:
 
 
 def clean_product_label(meta: dict) -> str:
-    source = str(meta.get("source", "")).strip().lower()
-    product_name = str(meta.get("product_name", "")).strip()
-    product_title = str(meta.get("product_title", "")).strip()
+    source = str(meta.get("source") or "").strip().lower()
+    product_name = str(meta.get("product_name") or "").strip()
+    product_title = str(meta.get("product_title") or "").strip()
 
     if product_title:
         return product_title
@@ -1058,7 +1740,10 @@ def detailed_health():
 def dashboard_summary():
     dataset_path = get_insights_dataset_path()
     if dataset_path is None:
-        return {"error": "No parquet dataset found. Run the normalization pipeline first."}
+        snowflake_table = _snowflake_insights_table()
+        if snowflake_table:
+            return build_snowflake_dashboard_summary(snowflake_table)
+        return {"error": "No parquet dataset or Snowflake table found. Run the normalization pipeline first."}
 
     return build_dashboard_summary(
         normalized_path=settings.normalized_parquet_path,
@@ -1074,9 +1759,12 @@ def review_filter_options(
     limit: int = Query(200, ge=1, le=1000),
     max_rows: Optional[int] = Query(None, ge=1, le=1000000),
 ):
-    dataset_path = settings.sentiment_parquet_path if settings.sentiment_parquet_path.exists() else get_insights_dataset_path()
+    dataset_path = settings.sentiment_parquet_path if _has_parquet_files(settings.sentiment_parquet_path) else get_insights_dataset_path()
     if dataset_path is None:
-        return {"error": "No parquet dataset found. Run the normalization pipeline first."}
+        snowflake_table = _snowflake_insights_table()
+        if snowflake_table:
+            return build_snowflake_review_options(snowflake_table, limit=limit)
+        return {"error": "No parquet dataset or Snowflake table found. Run the normalization pipeline first."}
     return list_filter_options(dataset_path, limit=limit, max_rows=max_rows)
 
 
@@ -1094,9 +1782,6 @@ def review_explorer(
     limit: int = Query(25, ge=1, le=100),
     offset: int = Query(0, ge=0),
 ):
-    dataset_path = settings.sentiment_parquet_path if settings.sentiment_parquet_path.exists() else get_insights_dataset_path()
-    if dataset_path is None:
-        return {"error": "No parquet dataset found. Run the normalization pipeline first."}
     filters = build_review_filter(
         query=query,
         source=source,
@@ -1108,14 +1793,23 @@ def review_explorer(
         min_rating=min_rating,
         max_rating=max_rating,
     )
+    dataset_path = settings.sentiment_parquet_path if _has_parquet_files(settings.sentiment_parquet_path) else get_insights_dataset_path()
+    if dataset_path is None:
+        snowflake_table = _snowflake_insights_table()
+        if snowflake_table:
+            return explore_snowflake_reviews(snowflake_table, filters, limit=limit, offset=offset)
+        return {"error": "No parquet dataset or Snowflake table found. Run the normalization pipeline first."}
     return explore_reviews(dataset_path, filters, limit=limit, offset=offset)
 
 
 @app.get("/stats/sources")
 def source_stats():
     parquet_path = settings.sentiment_parquet_path
-    if not parquet_path.exists():
-        return {"error": "Sentiment parquet not found. Run the earlier pipeline steps first."}
+    if not _has_parquet_files(parquet_path):
+        snowflake_table = _snowflake_insights_table()
+        if snowflake_table:
+            return build_snowflake_source_stats(snowflake_table)
+        return {"error": "No sentiment parquet or Snowflake table found. Run the earlier pipeline steps first."}
 
     return build_source_stats_cached(
         str(parquet_path),
@@ -1191,8 +1885,6 @@ def sentiment_analytics(
     max_rows: Optional[int] = Query(None, ge=1, le=1000000),
 ):
     dataset_path = settings.sentiment_parquet_path
-    if not dataset_path.exists():
-        return {"error": "Sentiment parquet not found. Run the sentiment pipeline first."}
     filters = build_review_filter(
         query=query,
         source=source,
@@ -1204,6 +1896,11 @@ def sentiment_analytics(
         min_rating=min_rating,
         max_rating=max_rating,
     )
+    if not _has_parquet_files(dataset_path):
+        snowflake_table = _snowflake_insights_table()
+        if snowflake_table:
+            return build_snowflake_sentiment_analytics(snowflake_table, filters, max_rows=max_rows)
+        return {"error": "No sentiment parquet or Snowflake table found. Run the sentiment pipeline first."}
     return build_sentiment_analytics(dataset_path, filters, max_rows=max_rows)
 
 
@@ -1217,8 +1914,6 @@ def product_compare(
     max_rows: Optional[int] = Query(None, ge=1, le=1000000),
 ):
     dataset_path = settings.sentiment_parquet_path
-    if not dataset_path.exists():
-        return {"error": "Sentiment parquet not found. Run the sentiment pipeline first."}
     product_names = [part.strip() for part in products.split(",") if part.strip()]
     if not product_names:
         return {"error": "Provide at least one product name."}
@@ -1228,6 +1923,11 @@ def product_compare(
         date_start=date_start,
         date_end=date_end,
     )
+    if not _has_parquet_files(dataset_path):
+        snowflake_table = _snowflake_insights_table()
+        if snowflake_table:
+            return compare_snowflake_products(snowflake_table, product_names, filters, max_rows=max_rows)
+        return {"error": "No sentiment parquet or Snowflake table found. Run the sentiment pipeline first."}
     return compare_products(dataset_path, product_names, filters, max_rows=max_rows)
 
 
@@ -1243,8 +1943,6 @@ def aspect_summary(
     max_rows: Optional[int] = Query(None, ge=1, le=1000000),
 ):
     dataset_path = settings.sentiment_parquet_path
-    if not dataset_path.exists():
-        return {"error": "Sentiment parquet not found. Run the sentiment pipeline first."}
     filters = build_review_filter(
         query=query,
         source=source,
@@ -1254,6 +1952,11 @@ def aspect_summary(
         date_start=date_start,
         date_end=date_end,
     )
+    if not _has_parquet_files(dataset_path):
+        snowflake_table = _snowflake_insights_table()
+        if snowflake_table:
+            return build_snowflake_aspect_intelligence(snowflake_table, filters, max_rows=max_rows)
+        return {"error": "No sentiment parquet or Snowflake table found. Run the sentiment pipeline first."}
     return build_aspect_intelligence(dataset_path, filters, max_rows=max_rows)
 
 

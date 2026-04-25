@@ -142,6 +142,7 @@ celerybeat.pid
 # Environments
 .env
 .envrc
+docker/airflow/.env.deploy
 .venv
 env/
 venv/

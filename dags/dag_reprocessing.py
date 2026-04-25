@@ -17,7 +17,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Any
 
-from dags.dag_ingestion import (
+from dags.reviewpulse_airflow_common import (
     _build_processing_task_specs,
     _load_airflow_objects,
     _log_airflow_task_completed,
