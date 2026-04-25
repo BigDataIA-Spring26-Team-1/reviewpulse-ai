@@ -23,7 +23,7 @@ The project is data-first. Ingestion, storage, Spark normalization, data quality
 | Backend | https://reviewpulse-api-3ogueqhipq-uc.a.run.app/docs |
 | Frontend | https://reviewpulse-ai.streamlit.app |
 | Codelabs | |
-| Video Demo on YouTube | |
+| Video Demo on YouTube | https://youtu.be/_BFsHwxeCTs |
  
 ## Final Project Checklist
  
