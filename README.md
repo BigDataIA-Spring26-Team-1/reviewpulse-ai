@@ -15,7 +15,7 @@ The application is built to answer review-grounded questions such as:
  
 The project is data-first. Ingestion, storage, Spark normalization, data quality checks, sentiment scoring, aspect extraction, embeddings, retrieval, and observability are the core system. The LLM-backed answer layer is optional and falls back to deterministic summaries when no external LLM key is configured.
 
- ## Submission Links
+## Submission Links
 
 | Requirement | Link / Status |
 | --- | --- |
@@ -23,7 +23,7 @@ The project is data-first. Ingestion, storage, Spark normalization, data quality
 | Backend | https://reviewpulse-api-3ogueqhipq-uc.a.run.app/docs |
 | Frontend | https://reviewpulse-ai.streamlit.app |
 | Codelabs | |
-| Video Demo on YouTube | [![ReviewPulse AI Demo](https://i.ytimg.com/vi/_BFsHwxeCTs/hqdefault.jpg)](https://youtu.be/_BFsHwxeCTs) |
+| Video Demo on YouTube | [![ReviewPulse AI Demo](https://i.ytimg.com/vi/_BFsHwxeCTs/hqdefault.jpg)](https://youtu.be/_BFsHwxeCTs)<br>https://youtu.be/_BFsHwxeCTs |
  
 ## Final Project Checklist
  
